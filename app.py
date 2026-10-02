@@ -548,10 +548,13 @@ max_doc_count = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔑 API Key 设置")
-tavily_api_key = st.sidebar.text_input(
-    "Tavily 全网搜索 API Key", value=DEFAULT_TAVILY_KEY, type="password"
-)
 
+# 安全从 st.secrets 获取，如果后台没配则默认为空字符串
+default_tavily = st.secrets.get("TAVILY_API_KEY", "") if hasattr(st, "secrets") else ""
+
+tavily_api_key = st.sidebar.text_input(
+    "Tavily 全网搜索 API Key", value=default_tavily, type="password"
+)
 openrouter_api_key = st.sidebar.text_input(
     "OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password"
 )
