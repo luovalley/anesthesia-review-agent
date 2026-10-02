@@ -1,9 +1,9 @@
-streamlit>=1.30.0
-biopython>=1.81
-openai>=1.0.0
-pandas>=2.0.0
-plotly>=5.0.0
-pypdf>=3.0.0
-python-docx>=1.1.0
-requests>=2.31.0
+streamlit
+pandas
+plotly
+openai
+biopython
 tavily-python
+pypdf
+python-docx
+python-dotenv
