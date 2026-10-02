@@ -1,5 +1,6 @@
 import os
 import streamlit as st
+import pandas as pd
 
 # 1. 自动适配 Streamlit Cloud 的 Secrets 并注入到环境变量
 try:
