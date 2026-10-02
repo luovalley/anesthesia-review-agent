@@ -277,45 +277,30 @@ def fetch_web_and_pubmed_literature(
   combined_data = []
   cleaned_query = clean_search_keyword(query_term)
 
-  # 1. Tavily 全网学术检索
+  # 1. Tavily 全网学术检索（使用官方 SDK）
   if tavily_api_key and tavily_api_key.strip():
     try:
-      url = "https://api.tavily.com/search"
+      from tavily import TavilyClient
       
-      # 必须使用标准的 HTTP Header 进行 Bearer 认证
-      headers = {
-          "Authorization": f"Bearer {tavily_api_key.strip()}",
-          "Content-Type": "application/json"
-      }
+      client = TavilyClient(api_key=tavily_api_key.strip())
+      response = client.search(
+          query=f"{cleaned_query} anesthesia perioperative trial review recent research 2021..2026",
+          search_depth="advanced",
+          max_results=max_results
+      )
       
-      payload = {
-          "query": (
-              f"{cleaned_query} anesthesia perioperative trial review recent"
-              " research 2021..2026"
-          ),
-          "search_depth": "advanced",
-          "max_results": max_results,
-      }
+      results = response.get("results", [])
+      if not results:
+        st.info(f"ℹ️ Tavily 未能针对关键词【{cleaned_query}】检索到相关结果。")
       
-      response = requests.post(url, json=payload, headers=headers, timeout=15)
-
-      if response.status_code == 200:
-        results = response.json().get("results", [])
-        if not results:
-          st.info(f"ℹ️ Tavily 未能针对关键词【{cleaned_query}】检索到相关结果。")
-        for res in results:
-          combined_data.append({
-              "PMID/URL": res.get("url", "Web Link"),
-              "Title": res.get("title", ""),
-              "Abstract": res.get("content", ""),
-              "Year": "2021-2026",
-              "Source": "全网学术搜索 (Tavily)",
-          })
-      else:
-        st.error(
-            f"⚠️ Tavily API 调用失败！状态码: {response.status_code},"
-            f" 响应内容: {response.text}"
-        )
+      for res in results:
+        combined_data.append({
+            "PMID/URL": res.get("url", "Web Link"),
+            "Title": res.get("title", ""),
+            "Abstract": res.get("content", ""),
+            "Year": "2021-2026",
+            "Source": "全网学术搜索 (Tavily)",
+        })
     except Exception as e:
       st.warning(f"Tavily 全网搜索出现异常: {str(e)}")
 
