@@ -5,6 +5,7 @@ import requests
 import pandas as pd
 import streamlit as st
 from Bio import Entrez
+from collections import Counter
 
 # 1. 自动适配 Streamlit Cloud 的 Secrets 并注入到环境变量
 try:
