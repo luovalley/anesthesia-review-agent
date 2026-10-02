@@ -35,10 +35,15 @@ try:
 except ImportError:
     pass
 
+def normalize_key(v):
+    """去掉首尾空白、换行和误带的引号。"""
+    return str(v or "").strip().strip("\"'“”‘’").strip()
+
+
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "").strip()
 NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
-ENV_TAVILY_KEY = os.getenv("TAVILY_API_KEY", "").strip()
-ENV_OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+ENV_TAVILY_KEY = normalize_key(os.getenv("TAVILY_API_KEY", ""))
+ENV_OPENROUTER_KEY = normalize_key(os.getenv("OPENROUTER_API_KEY", ""))
 
 # 邮箱改为从环境变量读取，不再把个人邮箱写死在公开代码里
 Entrez.email = NCBI_EMAIL or None
@@ -564,9 +569,19 @@ openrouter_input = st.sidebar.text_input(
     value="", type="password",
     placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
 )
-tavily_api_key = tavily_input.strip() or ENV_TAVILY_KEY
-openrouter_api_key = openrouter_input.strip() or ENV_OPENROUTER_KEY
+tavily_api_key = normalize_key(tavily_input) or ENV_TAVILY_KEY
+openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
 openrouter_model = st.sidebar.text_input("首选 AI 模型", value=DEFAULT_OPENROUTER_MODEL)
+
+if tavily_api_key:
+    _src = "侧边栏输入" if normalize_key(tavily_input) else "后台 Secrets"
+    _hint = "" if tavily_api_key.startswith("tvly-") else "（⚠️ 正常应以 tvly- 开头）"
+    st.sidebar.caption(
+        f"🩺 Tavily Key 来源：{_src}，长度 {len(tavily_api_key)}，"
+        f"前缀 `{tavily_api_key[:5]}` {_hint}"
+    )
+else:
+    st.sidebar.caption("🩺 未检测到 Tavily Key。")
 
 if not NCBI_EMAIL:
     st.sidebar.caption("ℹ️ 未配置 NCBI_EMAIL，建议在 Secrets 中设置（NCBI 要求提供联系邮箱）。")
