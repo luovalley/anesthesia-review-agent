@@ -7,6 +7,7 @@ import streamlit as st
 import plotly.express as px
 from openai import OpenAI
 from Bio import Entrez
+Entrez.email = "iconandy697@gmail.com"
 from collections import Counter
 
 # 1. 自动适配 Streamlit Cloud 的 Secrets 并注入到环境变量
