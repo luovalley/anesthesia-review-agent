@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import io
 import os
 import re
@@ -21,9 +22,11 @@ st.set_page_config(
 # ==========================================
 # 1. 凭证加载（Streamlit Secrets -> 环境变量 -> .env）
 # ==========================================
+_SECRET_VALUES = {}  # 仅用于诊断：记录 Secrets 里实际读到了什么
 try:
     for _k, _v in st.secrets.items():
         if isinstance(_v, (str, int, float)):  # 跳过嵌套表
+            _SECRET_VALUES[_k] = str(_v)
             os.environ.setdefault(_k, str(_v))
 except Exception:
     pass  # 本地没有 secrets.toml 时会抛异常，直接跳过
@@ -299,27 +302,42 @@ def parse_uploaded_files(uploaded_files):
 # 4. 检索引擎：Tavily 全网 + PubMed
 #    出错时抛异常（异常不会被 st.cache_data 缓存，避免把失败结果缓存 1 小时）
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def search_tavily(query, api_key, max_results):
-    from tavily import TavilyClient
+def tavily_request(api_key, query, max_results):
+    """直接调用 Tavily REST 接口。出错时抛出带状态码和 Key 末4位的异常，便于核对。"""
+    import requests
 
     start, today = get_past_5_years_range()
-    client = TavilyClient(api_key=api_key)
-    resp = client.search(
-        query=(
-            f"{query} anesthesia perioperative trial review "
-            f"recent research {start.year}-{today.year}"
-        ),
-        search_depth="advanced",
-        max_results=min(int(max_results), TAVILY_MAX_RESULTS),
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "query": (
+                f"{query} anesthesia perioperative trial review "
+                f"recent research {start.year}-{today.year}"
+            ),
+            "search_depth": "advanced",
+            "max_results": min(int(max_results), TAVILY_MAX_RESULTS),
+        },
+        timeout=60,
     )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {resp.status_code}: {resp.text[:200]} "
+            f"（实际发送的 Key：长度 {len(api_key)}，末4位 `{api_key[-4:]}`）"
+        )
+    return resp.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_tavily(query, api_key, max_results):
+    data = tavily_request(api_key, query, max_results)
     rows = []
-    for res in resp.get("results", []):
+    for res in data.get("results", []):
         rows.append({
             "PMID/URL": res.get("url", "Web Link"),
             "Title": res.get("title", ""),
             "Abstract": res.get("content", ""),
-            "Year": "N/A（网页）",  # 原代码把年份硬写成 2021-2026，并不真实
+            "Year": "N/A（网页）",
             "Source": "全网学术搜索 (Tavily)",
         })
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
@@ -559,30 +577,61 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔑 API Key 设置")
 # 安全：不再把后台 Secrets 预填进输入框。
 # 否则 type="password" 的值仍会发送到访客浏览器，任何人都能取走你的密钥。
+_AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
-    value="", type="password",
+    value="", type="password", **_AC,
     placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
 )
 openrouter_input = st.sidebar.text_input(
     "OpenRouter API Key",
-    value="", type="password",
+    value="", type="password", **_AC,
     placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
 )
-tavily_api_key = normalize_key(tavily_input) or ENV_TAVILY_KEY
+_typed_tavily = normalize_key(tavily_input)
+_typed_tavily_rejected = bool(_typed_tavily) and not _typed_tavily.startswith("tvly-")
+if _typed_tavily_rejected:
+    _typed_tavily = ""  # 多为浏览器自动填充的无关内容，忽略并使用后台 Key
+tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
 openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
 openrouter_model = st.sidebar.text_input("首选 AI 模型", value=DEFAULT_OPENROUTER_MODEL)
 
-if tavily_api_key:
-    _src = "侧边栏输入" if normalize_key(tavily_input) else "后台 Secrets"
-    _hint = "" if tavily_api_key.startswith("tvly-") else "（⚠️ 正常应以 tvly- 开头）"
-    st.sidebar.caption(
-        f"🩺 Tavily Key 来源：{_src}，长度 {len(tavily_api_key)}，"
-        f"前缀 `{tavily_api_key[:5]}` {_hint}"
-    )
-else:
-    st.sidebar.caption("🩺 未检测到 Tavily Key。")
+def _mask(k):
+    return f"长度 {len(k)}，前缀 `{k[:5]}`，末4位 `{k[-4:]}`" if k else "（空）"
 
+
+with st.sidebar.expander("🩺 Tavily Key 诊断", expanded=bool(tavily_api_key) is False):
+    _sec = normalize_key(_SECRET_VALUES.get("TAVILY_API_KEY", ""))
+    st.write("**Streamlit Secrets 中的值：**", _mask(_sec) if _sec else "未读到 TAVILY_API_KEY")
+    st.write("**侧边栏输入框：**", _mask(normalize_key(tavily_input)) if normalize_key(tavily_input) else "（空）")
+    st.write("**环境变量最终值：**", _mask(ENV_TAVILY_KEY))
+    if normalize_key(tavily_input):
+        _src = "侧边栏输入框"
+    elif ENV_TAVILY_KEY and ENV_TAVILY_KEY == _sec:
+        _src = "Streamlit Secrets"
+    elif ENV_TAVILY_KEY:
+        _src = ".env 文件或系统环境变量（⚠️ 与 Secrets 不一致）"
+    else:
+        _src = "无"
+    st.write("**本次实际使用：**", _src, "|", _mask(tavily_api_key))
+    if _typed_tavily_rejected:
+        st.warning("输入框内容不是以 tvly- 开头，已忽略（可能是浏览器自动填充），改用后台 Key。")
+    if tavily_api_key and not tavily_api_key.startswith("tvly-"):
+        st.warning("Key 应以 tvly- 开头，当前值可能填错。")
+    try:
+        import importlib.metadata as _md
+        st.caption(f"Streamlit {st.__version__}")
+    except Exception:
+        pass
+    if st.button("测试这个 Key"):
+        if not tavily_api_key:
+            st.error("没有可用的 Key。")
+        else:
+            try:
+                tavily_request(tavily_api_key, "anesthesia", 1)
+                st.success("✅ Key 有效")
+            except Exception as e:
+                st.error(f"❌ {e}")
 if not NCBI_EMAIL:
     st.sidebar.caption("ℹ️ 未配置 NCBI_EMAIL，建议在 Secrets 中设置（NCBI 要求提供联系邮箱）。")
 
