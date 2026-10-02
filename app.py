@@ -225,6 +225,37 @@ def get_past_5_years_date_filter():
     )
 
 
+def doc_link(identifier):
+    """把 PMID/URL 转成可访问链接；本地文件返回 (None, 显示文字)。"""
+    ident = str(identifier or "").strip()
+    if ident.upper().startswith("PMID:"):
+        pmid = ident.split(":", 1)[1].strip()
+        return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", f"PMID:{pmid}"
+    if ident.lower().startswith(("http://", "https://")):
+        return ident, ident
+    if ident.isdigit():  # CSV 中的纯数字 PMID
+        return f"https://pubmed.ncbi.nlm.nih.gov/{ident}/", f"PMID:{ident}"
+    return None, "本地上传文件（无在线链接）"
+
+
+def _md_escape(text):
+    text = re.sub(r"\s+", " ", str(text or "")).strip() or "（无标题）"
+    return re.sub(r"([\\`*_{}\[\]<>|])", r"\\\1", text)
+
+
+def build_literature_markdown(df):
+    """生成 Markdown 文献清单：标题（可点击）、年份、PMID/URL。"""
+    lines = []
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        url, shown = doc_link(row.get("PMID/URL"))
+        title = _md_escape(row.get("Title"))
+        year = str(row.get("Year") or "N/A")
+        head = f"[{title}]({url})" if url else title
+        link_part = f"[{shown}]({url})" if url else shown
+        lines.append(f"{i}. **{head}**  \n   年份：{year} ｜ 链接：{link_part}")
+    return "\n\n".join(lines)
+
+
 def clean_search_keyword(raw_text):
     if not raw_text:
         return "Anesthesia"
@@ -700,13 +731,14 @@ with tab1:
 with tab2:
     st.subheader("已调用的文献数据明细")
     if not all_docs.empty:
-        docs = all_docs.copy()
-        docs["匹配热点"] = docs.apply(
-            lambda r: ", ".join(extract_clinical_topics(f"{r['Title']} {r['Abstract']}")),
-            axis=1,
-        )
-        st.dataframe(
-            docs[["Title", "Year", "Source", "匹配热点", "PMID/URL"]], **STRETCH
+        lit_md = build_literature_markdown(all_docs)
+        st.caption(f"共 {len(all_docs)} 篇（点击标题或链接可直接访问）")
+        st.markdown(lit_md)
+        st.download_button(
+            label="📥 下载文献清单 (.md)",
+            data=f"# 文献清单：{review_topic or '未指定主题'}\n\n{lit_md}\n",
+            file_name="文献清单.md",
+            mime="text/markdown",
         )
     else:
         st.info("暂无文献数据。")
