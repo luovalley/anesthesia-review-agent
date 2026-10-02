@@ -4,6 +4,7 @@ import datetime
 import requests
 import pandas as pd
 import streamlit as st
+from Bio import Entrez
 
 # 1. 自动适配 Streamlit Cloud 的 Secrets 并注入到环境变量
 try:
@@ -275,12 +276,18 @@ def fetch_web_and_pubmed_literature(
   combined_data = []
   cleaned_query = clean_search_keyword(query_term)
 
-  # 1. Tavily 全网学术检索 (已修复此处的缩进对齐问题)
+  # 1. Tavily 全网学术检索
   if tavily_api_key and tavily_api_key.strip():
     try:
       url = "https://api.tavily.com/search"
+      
+      # 必须使用标准的 HTTP Header 进行 Bearer 认证
+      headers = {
+          "Authorization": f"Bearer {tavily_api_key.strip()}",
+          "Content-Type": "application/json"
+      }
+      
       payload = {
-          "api_key": tavily_api_key.strip(),
           "query": (
               f"{cleaned_query} anesthesia perioperative trial review recent"
               " research 2021..2026"
@@ -288,7 +295,8 @@ def fetch_web_and_pubmed_literature(
           "search_depth": "advanced",
           "max_results": max_results,
       }
-      response = requests.post(url, json=payload, timeout=15)
+      
+      response = requests.post(url, json=payload, headers=headers, timeout=15)
 
       if response.status_code == 200:
         results = response.json().get("results", [])
