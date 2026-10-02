@@ -478,6 +478,36 @@ def call_openrouter_with_fallback(client, primary_model, messages, temperature=0
     raise RuntimeError(f"所有备选模型均未能正常生成响应。最后报错细节: {last_error}")
 
 
+MAX_CONTINUATIONS = 4  # 单次最多自动续写次数
+
+
+def call_with_continuation(client, primary_model, messages, temperature=0.3):
+    """调用模型；若因长度上限被截断（finish_reason == "length"），自动让模型接着写并拼接。"""
+    text, used_model, finish = call_openrouter_with_fallback(
+        client, primary_model, messages, temperature
+    )
+    for _ in range(MAX_CONTINUATIONS):
+        if finish != "length":
+            break
+        cont_messages = list(messages) + [
+            {"role": "assistant", "content": text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一段输出因长度上限被中断。请紧接上文最后一个字继续写完剩余全部内容："
+                    "不要重复已输出的内容，不要任何开场白或解释；若上文中断在表格中，"
+                    "请从该表格的下一行继续；务必完整写完所有未完成的章节（含总结与展望）。"
+                ),
+            },
+        ]
+        # 优先沿用同一个模型续写
+        more, used_model, finish = call_openrouter_with_fallback(
+            client, used_model, cont_messages, temperature
+        )
+        text += more
+    return text, used_model, finish
+
+
 def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df):
     try:
         clean_key = str(api_key).strip()
@@ -558,7 +588,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             {"role": "user", "content": prompt},
         ]
 
-        result, used_model, finish = call_openrouter_with_fallback(
+        result, used_model, finish = call_with_continuation(
             client, model_name, messages, temperature=0.3
         )
         return wrap_article(result, used_model, finish), result, messages
@@ -569,7 +599,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 def wrap_article(result, used_model, finish):
     note = ""
     if finish == "length":
-        note = "\n\n> ⚠️ *输出因长度上限被截断，可更换模型后重新生成或要求“继续补全”。*"
+        note = "\n\n> ⚠️ *输出经多次自动续写后仍未写完，可在下方提交“继续补全未完成章节”，或更换模型。*"
     return (
         f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网文献生成，"
         f"内容须经专业人员核实后方可使用*\n\n" + result + note
@@ -610,7 +640,7 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
         + list(qa_history[-6:])
         + [{"role": "user", "content": directive}]
     )
-    return call_openrouter_with_fallback(client, model_name, messages, temperature=temperature)
+    return call_with_continuation(client, model_name, messages, temperature=temperature)
 
 
 # ==========================================
@@ -755,7 +785,7 @@ with tab1:
         elif local_df.empty and web_df.empty:
             st.warning("当前没有文献数据，请先点击“开始检索文献”或上传文件！")
         else:
-            with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-3 分钟，请稍候..."):
+            with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
                 display_text, raw_text, base_msgs = generate_5000_words_review(
                     openrouter_api_key, openrouter_model, review_topic, local_df, web_df
                 )
