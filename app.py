@@ -22,11 +22,9 @@ st.set_page_config(
 # ==========================================
 # 1. 凭证加载（Streamlit Secrets -> 环境变量 -> .env）
 # ==========================================
-_SECRET_VALUES = {}  # 仅用于诊断：记录 Secrets 里实际读到了什么
 try:
     for _k, _v in st.secrets.items():
         if isinstance(_v, (str, int, float)):  # 跳过嵌套表
-            _SECRET_VALUES[_k] = str(_v)
             os.environ.setdefault(_k, str(_v))
 except Exception:
     pass  # 本地没有 secrets.toml 时会抛异常，直接跳过
@@ -596,42 +594,6 @@ tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
 openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
 openrouter_model = st.sidebar.text_input("首选 AI 模型", value=DEFAULT_OPENROUTER_MODEL)
 
-def _mask(k):
-    return f"长度 {len(k)}，前缀 `{k[:5]}`，末4位 `{k[-4:]}`" if k else "（空）"
-
-
-with st.sidebar.expander("🩺 Tavily Key 诊断", expanded=bool(tavily_api_key) is False):
-    _sec = normalize_key(_SECRET_VALUES.get("TAVILY_API_KEY", ""))
-    st.write("**Streamlit Secrets 中的值：**", _mask(_sec) if _sec else "未读到 TAVILY_API_KEY")
-    st.write("**侧边栏输入框：**", _mask(normalize_key(tavily_input)) if normalize_key(tavily_input) else "（空）")
-    st.write("**环境变量最终值：**", _mask(ENV_TAVILY_KEY))
-    if normalize_key(tavily_input):
-        _src = "侧边栏输入框"
-    elif ENV_TAVILY_KEY and ENV_TAVILY_KEY == _sec:
-        _src = "Streamlit Secrets"
-    elif ENV_TAVILY_KEY:
-        _src = ".env 文件或系统环境变量（⚠️ 与 Secrets 不一致）"
-    else:
-        _src = "无"
-    st.write("**本次实际使用：**", _src, "|", _mask(tavily_api_key))
-    if _typed_tavily_rejected:
-        st.warning("输入框内容不是以 tvly- 开头，已忽略（可能是浏览器自动填充），改用后台 Key。")
-    if tavily_api_key and not tavily_api_key.startswith("tvly-"):
-        st.warning("Key 应以 tvly- 开头，当前值可能填错。")
-    try:
-        import importlib.metadata as _md
-        st.caption(f"Streamlit {st.__version__}")
-    except Exception:
-        pass
-    if st.button("测试这个 Key"):
-        if not tavily_api_key:
-            st.error("没有可用的 Key。")
-        else:
-            try:
-                tavily_request(tavily_api_key, "anesthesia", 1)
-                st.success("✅ Key 有效")
-            except Exception as e:
-                st.error(f"❌ {e}")
 if not NCBI_EMAIL:
     st.sidebar.caption("ℹ️ 未配置 NCBI_EMAIL，建议在 Secrets 中设置（NCBI 要求提供联系邮箱）。")
 
