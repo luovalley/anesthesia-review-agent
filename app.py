@@ -555,8 +555,11 @@ default_tavily = st.secrets.get("TAVILY_API_KEY", "") if hasattr(st, "secrets") 
 tavily_api_key = st.sidebar.text_input(
     "Tavily 全网搜索 API Key", value=default_tavily, type="password"
 )
+# 安全从 st.secrets 获取 OpenRouter 密钥，未配置则为空
+default_openrouter = st.secrets.get("OPENROUTER_API_KEY", "") if hasattr(st, "secrets") else ""
+
 openrouter_api_key = st.sidebar.text_input(
-    "OpenRouter API Key", value=DEFAULT_OPENROUTER_KEY, type="password"
+    "OpenRouter API Key", value=default_openrouter, type="password"
 )
 
 openrouter_model = st.sidebar.text_input(
