@@ -561,15 +561,56 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
         result, used_model, finish = call_openrouter_with_fallback(
             client, model_name, messages, temperature=0.3
         )
-        note = ""
-        if finish == "length":
-            note = "\n\n> ⚠️ *输出因长度上限被截断，可更换模型后重新生成。*"
-        return (
-            f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网文献生成，"
-            f"内容须经专业人员核实后方可使用*\n\n" + result + note
-        )
+        return wrap_article(result, used_model, finish), result, messages
     except Exception as e:
-        return f"❌ 深度综述生成失败: {e}"
+        return f"❌ 深度综述生成失败: {e}", None, None
+
+
+def wrap_article(result, used_model, finish):
+    note = ""
+    if finish == "length":
+        note = "\n\n> ⚠️ *输出因长度上限被截断，可更换模型后重新生成或要求“继续补全”。*"
+    return (
+        f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网文献生成，"
+        f"内容须经专业人员核实后方可使用*\n\n" + result + note
+    )
+
+
+REVISE_MODE = "✏️ 修改综述（输出完整新版本）"
+ASK_MODE = "💬 提问讨论（不改动文章）"
+
+
+def follow_up_review(api_key, model_name, base_messages, current_article,
+                     qa_history, user_text, mode):
+    """多轮追问/修改。每轮只携带：原始资料 + 当前最新版全文 + 最近 6 条问答，避免上下文越滚越大。"""
+    clean_key = str(api_key).strip()
+    if not clean_key:
+        raise RuntimeError("请填入有效的 OpenRouter API Key！")
+    client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
+
+    if mode == REVISE_MODE:
+        directive = (
+            "请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
+            "（保持 7 个章节结构与 Markdown 表格，不得省略、缩写或中途截断；"
+            "只能引用背景资料中出现的文献，严禁编造；直接输出文章，不要额外解释）。\n\n"
+            f"修改意见：{user_text}"
+        )
+        temperature = 0.3
+    else:
+        directive = (
+            "请基于上述综述与背景资料回答下面的问题，简明准确，不要重写全文；"
+            "只能依据背景资料中的文献，严禁编造，资料不足请直说。\n\n"
+            f"问题：{user_text}"
+        )
+        temperature = 0.4
+
+    messages = (
+        list(base_messages)
+        + [{"role": "assistant", "content": current_article}]
+        + list(qa_history[-6:])
+        + [{"role": "user", "content": directive}]
+    )
+    return call_openrouter_with_fallback(client, model_name, messages, temperature=temperature)
 
 
 # ==========================================
@@ -583,8 +624,11 @@ ss = st.session_state
 ss.setdefault("web_df", pd.DataFrame(columns=DOC_COLUMNS))
 ss.setdefault("searched_topic", "")
 ss.setdefault("search_msgs", [])
-ss.setdefault("article_md", "")
 ss.setdefault("article_topic", "")
+ss.setdefault("versions", [])        # [{"label":..., "text":...}]
+ss.setdefault("base_messages", [])   # 初次生成时的 system + user(含全部资料)
+ss.setdefault("current_raw", "")     # 最新版正文（不含页眉提示）
+ss.setdefault("qa_history", [])      # 多轮提问/修改记录
 
 st.title("💉 麻醉学全网文献热点追踪与深度综述生成系统")
 st.markdown(
@@ -700,6 +744,7 @@ with tab1:
     st.caption(
         "系统将融合本地文献与全网学术搜索（Tavily）以及 PubMed 数据库近 5 年的研究，"
         "探讨学术争论并输出临床转化表格。请先在侧边栏点击“开始检索文献”。"
+        "初稿生成后，可在文章下方多轮提问或提交修改意见。"
     )
 
     if st.button("🚀 撰写深度综述", type="primary"):
@@ -711,22 +756,89 @@ with tab1:
             st.warning("当前没有文献数据，请先点击“开始检索文献”或上传文件！")
         else:
             with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-3 分钟，请稍候..."):
-                ss["article_md"] = generate_5000_words_review(
+                display_text, raw_text, base_msgs = generate_5000_words_review(
                     openrouter_api_key, openrouter_model, review_topic, local_df, web_df
                 )
+            if raw_text is None:
+                st.error(display_text)
+            else:
+                ss["versions"] = [{"label": "V1 初稿", "text": display_text}]
+                ss["base_messages"] = base_msgs
+                ss["current_raw"] = raw_text
+                ss["qa_history"] = []
                 ss["article_topic"] = review_topic
 
     # 结果存入 session_state：否则点击下载按钮触发 rerun 后文章会消失
-    if ss["article_md"]:
+    if ss["versions"]:
         st.markdown("---")
-        st.markdown(ss["article_md"])
+        versions = ss["versions"]
+        if len(versions) > 1:
+            idx = st.selectbox(
+                "查看版本：", options=range(len(versions)),
+                index=len(versions) - 1,
+                format_func=lambda i: versions[i]["label"],
+            )
+        else:
+            idx = 0
+        shown = versions[idx]
+        st.markdown(shown["text"])
+
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", ss["article_topic"])
+        ver_tag = shown["label"].split()[0]
         st.download_button(
-            label="📥 下载完整综述文章 (.md)",
-            data=ss["article_md"],
-            file_name=f"{safe_name}_全网深度知识更新综述.md",
+            label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
+            data=shown["text"],
+            file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
             mime="text/markdown",
         )
+
+        # ---------- 多轮提问与修改 ----------
+        st.markdown("---")
+        st.subheader("💬 继续提问 / 提交修改意见")
+        st.caption("“修改”模式会基于最新版生成完整新版本并保留历史版本；“提问”模式只回答问题，不改动文章。")
+
+        for msg in ss["qa_history"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        with st.form("followup_form", clear_on_submit=True):
+            mode = st.radio("本次操作：", [REVISE_MODE, ASK_MODE], horizontal=True)
+            user_text = st.text_area(
+                "请输入内容：", height=120,
+                placeholder="修改示例：把第四章的争论部分扩写，并增加关于老年患者的讨论；"
+                            "提问示例：第六章表格中的肌松监测建议依据是什么？",
+            )
+            submitted = st.form_submit_button("提交", type="primary")
+
+        if submitted:
+            if not user_text.strip():
+                st.warning("请输入修改意见或问题。")
+            elif not openrouter_api_key:
+                st.error("请在侧边栏填入有效的 OpenRouter API Key！")
+            else:
+                spinner_txt = "AI 正在修订全文，请稍候..." if mode == REVISE_MODE else "AI 正在思考..."
+                try:
+                    with st.spinner(spinner_txt):
+                        reply, used_model, finish = follow_up_review(
+                            openrouter_api_key, openrouter_model, ss["base_messages"],
+                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode,
+                        )
+                    if mode == REVISE_MODE:
+                        n = len(ss["versions"]) + 1
+                        short = re.sub(r"\s+", " ", user_text.strip())[:12]
+                        ss["versions"].append({
+                            "label": f"V{n} {short}",
+                            "text": wrap_article(reply, used_model, finish),
+                        })
+                        ss["current_raw"] = reply
+                        ss["qa_history"].append({"role": "user", "content": f"✏️ 修改：{user_text.strip()}"})
+                        ss["qa_history"].append({"role": "assistant", "content": f"已按要求生成第 {n} 版全文（见上方“查看版本”）。"})
+                    else:
+                        ss["qa_history"].append({"role": "user", "content": f"💬 提问：{user_text.strip()}"})
+                        ss["qa_history"].append({"role": "assistant", "content": reply})
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 处理失败: {e}")
 
 with tab2:
     st.subheader("已调用的文献数据明细")
