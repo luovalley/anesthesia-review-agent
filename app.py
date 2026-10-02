@@ -1,10 +1,20 @@
 import os
-from dotenv import load_dotenv
 import streamlit as st
 
-# 加载本地的 .env 文件（如果在云端平台，平台会自动注入系统环境变量）
-load_dotenv()
+# 1. 自动适配 Streamlit Cloud 的 Secrets 并注入到环境变量
+try:
+    if st.secrets:
+        for key, value in st.secrets.items():
+            os.environ[key] = str(value)
+except Exception:
+    pass
 
+# 2. 本地开发时尝试加载 .env（云端如果没有 python-dotenv 库则静默跳过，绝不报错）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 st.set_page_config(
     page_title="麻醉学全网文献热点追踪与 5000 字知识更新综述系统",
     page_icon="💉",
