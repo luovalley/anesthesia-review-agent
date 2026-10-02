@@ -278,12 +278,22 @@ def fetch_web_and_pubmed_literature(
   combined_data = []
   cleaned_query = clean_search_keyword(query_term)
 
-  # 1. Tavily 全网学术检索（使用官方 SDK）
-  if tavily_api_key and tavily_api_key.strip():
+  # 1. Tavily 全网学术检索
+  # 确保显式从参数或 st.secrets 获取，防止外部传入空值
+  current_tavily_key = tavily_api_key.strip() if tavily_api_key else ""
+  
+  if not current_tavily_key and hasattr(st, "secrets"):
+      current_tavily_key = st.secrets.get("TAVILY_API_KEY", "").strip()
+
+  if current_tavily_key:
     try:
       from tavily import TavilyClient
       
-      client = TavilyClient(api_key=tavily_api_key.strip())
+      # 打印前几位和后几位用于在日志中确认是否正确读取（中间打码）
+      masked_key = f"{current_tavily_key[:6]}...{current_tavily_key[-4:]}" if len(current_tavily_key) > 10 else "TOO_SHORT"
+      print(f"DEBUG: 正在使用 Tavily Key -> 长度: {len(current_tavily_key)}, 格式预览: {masked_key}")
+
+      client = TavilyClient(api_key=current_tavily_key)
       response = client.search(
           query=f"{cleaned_query} anesthesia perioperative trial review recent research 2021..2026",
           search_depth="advanced",
@@ -304,6 +314,8 @@ def fetch_web_and_pubmed_literature(
         })
     except Exception as e:
       st.warning(f"Tavily 全网搜索出现异常: {str(e)}")
+  else:
+    st.warning("⚠️ 警告：Tavily API Key 为空，已跳过全网搜索。请检查侧边栏输入或 Streamlit Secrets 配置。")
 
   # 2. PubMed 数据库检索
   try:
