@@ -14,7 +14,7 @@ from openai import OpenAI
 
 # set_page_config 必须是第一个 Streamlit 命令
 st.set_page_config(
-    page_title="麻醉学全网文献热点追踪与知识更新综述系统",
+    page_title="麻醉学全网文献热点追踪与 5000 字知识更新综述系统",
     page_icon="💉",
     layout="wide",
 )
@@ -519,6 +519,42 @@ def call_openrouter_with_fallback(client, primary_model, messages, temperature=0
     raise RuntimeError(f"所有备选模型均未能正常生成响应。最后报错细节: {last_error}")
 
 
+def parse_openrouter_models(payload):
+    """把 OpenRouter /models 返回解析成 [{id, label, free, ctx}]，仅保留文本输出模型。"""
+    models = []
+    for m in payload.get("data", []):
+        mid = m.get("id")
+        if not mid:
+            continue
+        outs = (m.get("architecture") or {}).get("output_modalities")
+        if outs and "text" not in outs:
+            continue
+        pricing = m.get("pricing") or {}
+        try:
+            free = mid.endswith(":free") or (
+                float(pricing.get("prompt", 1)) == 0 and float(pricing.get("completion", 1)) == 0
+            )
+        except (TypeError, ValueError):
+            free = mid.endswith(":free")
+        ctx = m.get("context_length") or 0
+        label = f"{mid}  ·  {ctx // 1000}k" if ctx else mid
+        models.append({"id": mid, "label": label, "free": free, "ctx": ctx})
+    return models
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_openrouter_models():
+    """获取 OpenRouter 当前可用模型（公开接口，无需 Key）。失败返回空列表，界面退回内置列表。"""
+    import requests
+
+    try:
+        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=15)
+        resp.raise_for_status()
+        return parse_openrouter_models(resp.json())
+    except Exception:
+        return []
+
+
 MAX_CONTINUATIONS = 4  # 单次最多自动续写次数
 
 
@@ -747,7 +783,44 @@ if _typed_tavily_rejected:
     _typed_tavily = ""  # 多为浏览器自动填充的无关内容，忽略并使用后台 Key
 tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
 openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
-openrouter_model = st.sidebar.text_input("首选 AI 模型", value=DEFAULT_OPENROUTER_MODEL)
+MODEL_CUSTOM = "✏️ 自定义模型 ID…"
+live_models = fetch_openrouter_models()
+free_only = st.sidebar.checkbox("仅显示免费模型", value=True)
+
+if live_models:
+    pool = [m for m in live_models if m["free"]] if free_only else live_models
+    if not pool:
+        pool = live_models
+    labels = {m["id"]: m["label"] for m in pool}
+    live_ids = {m["id"] for m in live_models}
+    # 内置推荐模型排在最前，其余按名称排序
+    ordered = [m for m in [DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS if m in labels]
+    ordered = list(dict.fromkeys(ordered)) + sorted(i for i in labels if i not in ordered)
+    # 备用链只保留当前确实存在的模型，避免在已下线模型上空等
+    _alive = [m for m in FALLBACK_FREE_MODELS if m in live_ids or m == "openrouter/free"]
+    if len(_alive) > 1:
+        FALLBACK_FREE_MODELS = _alive
+else:
+    labels = {m: m for m in FALLBACK_FREE_MODELS}
+    ordered = list(dict.fromkeys([DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS))
+    st.sidebar.caption("⚠️ 未能获取在线模型列表，已显示内置列表。")
+
+options = ordered + [MODEL_CUSTOM]
+default_idx = options.index(DEFAULT_OPENROUTER_MODEL) if DEFAULT_OPENROUTER_MODEL in options else 0
+choice = st.sidebar.selectbox(
+    "首选 AI 模型",
+    options=options,
+    index=default_idx,
+    format_func=lambda x: x if x == MODEL_CUSTOM else labels.get(x, x),
+    help="列表来自 OpenRouter 在线模型库（数字为上下文长度）。首选模型失败时会自动切换到备用模型。",
+)
+if choice == MODEL_CUSTOM:
+    openrouter_model = st.sidebar.text_input(
+        "自定义模型 ID", value=DEFAULT_OPENROUTER_MODEL,
+        placeholder="例如：provider/model-name:free",
+    ).strip() or DEFAULT_OPENROUTER_MODEL
+else:
+    openrouter_model = choice
 
 if not NCBI_EMAIL:
     st.sidebar.caption("ℹ️ 未配置 NCBI_EMAIL，建议在 Secrets 中设置（NCBI 要求提供联系邮箱）。")
