@@ -19,31 +19,67 @@ st.title("🩺 麻醉学全网文献热点追踪与 5000 字知识更新综述�
 st.markdown("---")
 
 # -----------------------------------------------------------------
-# 侧边栏配置
+# 侧边栏配置（完整保留与扩展）
 # -----------------------------------------------------------------
-st.sidebar.header("🔑 API 与参数配置")
-openrouter_api_key = st.sidebar.text_input("OpenRouter API Key", type="password")
-tavily_api_key = st.sidebar.text_input("Tavily API Key (可选)", type="password")
-model_name = st.sidebar.selectbox(
-    "选择大模型",
-    ["deepseek/deepseek-chat", "anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-2.5-pro"]
-)
+with st.sidebar:
+    st.header("🔑 API 与模型配置")
+    openrouter_api_key = st.text_input("OpenRouter API Key", type="password", help="用于调用 DeepSeek、Claude、GPT 等大模型")
+    tavily_api_key = st.text_input("Tavily API Key", type="password", help="用于获取全网灰色文献、临床指南与新闻")
+    
+    model_name = st.selectbox(
+        "选择大模型",
+        [
+            "deepseek/deepseek-chat",
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro"
+        ],
+        index=0
+    )
+    
+    st.markdown("---")
+    st.subheader("📚 目标麻醉学顶刊过滤")
+    target_journals = st.multiselect(
+        "选择重点监控期刊",
+        [
+            "Anesthesiology",
+            "British Journal of Anaesthesia (BJA)",
+            "Anesthesia & Analgesia",
+            "Regional Anesthesia and Pain Medicine (RAPM)",
+            "European Journal of Anaesthesiology (EJA)"
+        ],
+        default=["Anesthesiology", "British Journal of Anaesthesia (BJA)", "Anesthesia & Analgesia"]
+    )
+    
+    st.markdown("---")
+    st.subheader("⚙️ 检索与重排参数")
+    pub_retmax = st.slider("PubMed 最大检索量 (Retmax)", 50, 200, 200, step=25, help="放宽上限以确保前沿文献不漏网")
+    tavily_max = st.slider("Tavily 最大网页检索量", 10, 30, 25, step=5, help="补充全网指南与最新临床进展")
+    top_k_core = st.slider("精筛核心文献数 (Rerank Top K)", 20, 80, 50, step=10, help="送给大模型进行深度 Map-Reduce 的核心文献数")
+    
+    st.markdown("---")
+    st.subheader("📬 自动化推送配置 (可选)")
+    enable_push = st.checkbox("启用结果微信/TG推送", value=False)
+    pushplus_token = st.text_input("PushPlus Token", type="password") if enable_push else ""
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ 检索与过滤参数")
-pub_retmax = st.sidebar.slider("PubMed 最大检索量 (Retmax)", 50, 200, 200, step=25)
-tavily_max = st.sidebar.slider("Tavily 最大网页检索量", 10, 30, 25, step=5)
-top_k_core = st.sidebar.slider("精筛核心文献数 (Rerank Top K)", 20, 80, 50, step=10)
-
 # -----------------------------------------------------------------
-# 核心功能模块 1：PubMed 批量检索与解析
+# 核心功能模块 1：PubMed 批量检索与期刊过滤
 # -----------------------------------------------------------------
-def fetch_pubmed_papers(query, retmax=200):
+def fetch_pubmed_papers(query, journals, retmax=200):
     st.info(f"正在从 PubMed 检索最多 {retmax} 篇文献...")
+    
+    # 构造期刊过滤表达式
+    journal_query_part = ""
+    if journals:
+        j_filters = [f'"{j}"[Journal]' for j in journals]
+        journal_query_part = " AND (" + " OR ".join(j_filters) + ")"
+    
+    full_query = f"({query}){journal_query_part}"
+    
     base_search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     search_params = {
         "db": "pubmed",
-        "term": query,
+        "term": full_query,
         "retmax": retmax,
         "retmode": "json",
         "sort": "date"
@@ -54,7 +90,13 @@ def fetch_pubmed_papers(query, retmax=200):
         res_json = res.json()
         id_list = res_json.get("esearchresult", {}).get("idlist", [])
         if not id_list:
-            return []
+            # 如果加上期刊限制后无结果，尝试放宽期刊限制仅搜关键词
+            st.warning("指定期刊未直接命中，正在放宽至全 PubMed 检索...")
+            search_params["term"] = query
+            res = requests.get(base_search_url, params=search_params, timeout=15)
+            id_list = res.json().get("esearchresult", {}).get("idlist", [])
+            if not id_list:
+                return []
         
         # 批量获取详情 (efetch)
         base_fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -76,7 +118,6 @@ def fetch_pubmed_papers(query, retmax=200):
                 abstract_elem = article.find(".//Abstract/AbstractText")
                 abstract = abstract_elem.text if abstract_elem is not None else "无摘要"
                 
-                # 获取发表年份
                 year_elem = article.find(".//JournalIssue/PubDate/Year")
                 if year_elem is None:
                     year_elem = article.find(".//JournalIssue/PubDate/MedlineDate")
@@ -106,7 +147,7 @@ def fetch_tavily_web(query, api_key, max_results=25):
     url = "https://api.tavily.com/search"
     payload = {
         "api_key": api_key,
-        "query": f"{query} guidelines review clinical trial",
+        "query": f"{query} guidelines review clinical trial anesthesia",
         "max_results": max_results,
         "search_depth": "advanced"
     }
@@ -131,13 +172,11 @@ def fetch_tavily_web(query, api_key, max_results=25):
 # -----------------------------------------------------------------
 def compute_relevance_score(paper, query_keywords):
     score = 0.0
-    text_to_search = f"{paper.get('title', '')} {paper.get('abstract', '')}".lower()
-    
     for kw in query_keywords:
         kw_lower = kw.lower()
         title_matches = len(re.findall(re.escape(kw_lower), paper.get('title', '').lower()))
         abstract_matches = len(re.findall(re.escape(kw_lower), paper.get('abstract', '').lower()))
-        score += title_matches * 5.0   # 标题命中赋予高权重
+        score += title_matches * 5.0   # 标题命中权重更高
         score += abstract_matches * 1.0 # 摘要命中权重次之
 
     # 时效性加权
@@ -166,24 +205,23 @@ def smart_rerank_and_filter(papers, query, top_k=50):
         scored_papers.append(p)
         
     scored_papers.sort(key=lambda x: x['relevance_score'], reverse=True)
-    selected = scored_papers[:top_k]
-    return selected
+    return scored_papers[:top_k]
 
 # -----------------------------------------------------------------
 # 核心功能模块 4：分步式 (Map-Reduce) 综述生成
 # -----------------------------------------------------------------
 def map_subtopic_generation(client, model_name, subtopic_name, papers_subset):
     references_text = "\n\n".join([
-        f"- **[{p.get('title')}]** ({p.get('pub_date', 'N/A')})\n  内容摘要: {p.get('abstract', '无摘要')}"
+        f"- **[{p.get('title')}]** ({p.get('pub_date', 'N/A')})\n  摘要: {p.get('abstract', '无摘要')}"
         for p in papers_subset
     ])
     
     prompt = f"""
     您是一位麻醉学主任医师。请根据以下筛选出的 {len(papers_subset)} 篇核心文献，针对子主题【{subtopic_name}】撰写一份深度专业分析报告（约 1500~2000 字）。
     要求：
-    1. 必须紧扣麻醉学临床专业视角，深度剖析机制、数据、临床结局与指导价值。
+    1. 紧扣麻醉学临床专业视角，深度剖析机制、数据、临床结局与指导价值。
     2. 严格基于提供的文献，禁止虚构。
-    3. 包含必要的专业小结与对比要点。
+    3. 包含必要的对比表格或数据要点小结。
 
     核心文献列表：
     {references_text}
@@ -231,7 +269,7 @@ def reduce_synthesize_review(client, model_name, user_topic, subtopic_drafts):
 # 主界面交互逻辑
 # -----------------------------------------------------------------
 user_query = st.text_input(
-    "请输入您的检索/综述主题（例如：Propofol target-controlled infusion painless gastroscopy hypotension prevention）：",
+    "请输入您的检索/综述主题：",
     value="propofol painless gastroscopy hypotension respiratory depression Eleveld model"
 )
 
@@ -247,7 +285,7 @@ if st.button("🚀 开始多路检索、智能过滤与 5000 字综述生成", t
         with st.status("正在执行多步处理流水线...", expanded=True) as status:
             # 步骤 1：多路召回
             st.write("步骤 1/4: 正在多路召回海量文献...")
-            pubmed_papers = fetch_pubmed_papers(user_query, retmax=pub_retmax)
+            pubmed_papers = fetch_pubmed_papers(user_query, target_journals, retmax=pub_retmax)
             tavily_papers = fetch_tavily_web(user_query, tavily_api_key, max_results=tavily_max)
             all_raw_papers = pubmed_papers + tavily_papers
             st.write(f"✅ 召回完成：PubMed 检索到 {len(pubmed_papers)} 篇，Tavily 检索到 {len(tavily_papers)} 篇，总计 {len(all_raw_papers)} 篇。")
@@ -261,7 +299,7 @@ if st.button("🚀 开始多路检索、智能过滤与 5000 字综述生成", t
             core_papers = smart_rerank_and_filter(all_raw_papers, user_query, top_k=top_k_core)
             st.write(f"✅ 重排完成：已精选出相关性最高的 {len(core_papers)} 篇核心文献。")
             
-            # 步骤 3：Map 阶段（将核心文献等分为 3 组，生成子主题草稿）
+            # 步骤 3：Map 阶段
             st.write("步骤 3/4: 正在执行 Map 阶段：分主题深度提取核心机制与数据...")
             chunk_size = len(core_papers) // 3 if len(core_papers) >= 3 else 1
             group1 = core_papers[:chunk_size]
@@ -277,13 +315,13 @@ if st.button("🚀 开始多路检索、智能过滤与 5000 字综述生成", t
             subtopic_drafts = []
             for i, (sub_name, subset) in enumerate(subtopics):
                 if not subset:
-                    subset = core_papers[:5] # 兜底
+                    subset = core_papers[:5]
                 st.write(f"  - 正在生成子主题 {i+1}: 【{sub_name}】...")
                 draft = map_subtopic_generation(client, model_name, sub_name, subset)
                 subtopic_drafts.append(draft)
                 time.sleep(1)
                 
-            # 步骤 4：Reduce 阶段（宏观统筹与最终 5000 字综述合成）
+            # 步骤 4：Reduce 阶段
             st.write("步骤 4/4: 正在执行 Reduce 阶段：统筹融合成 5000 字高级学术综述...")
             final_review = reduce_synthesize_review(client, model_name, user_query, subtopic_drafts)
             
