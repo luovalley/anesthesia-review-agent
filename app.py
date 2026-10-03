@@ -785,14 +785,12 @@ tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
 openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
 MODEL_CUSTOM = "✏️ 自定义模型 ID…"
 live_models = fetch_openrouter_models()
-free_only = st.sidebar.checkbox("仅显示免费模型", value=True)
 
-if live_models:
-    pool = [m for m in live_models if m["free"]] if free_only else live_models
-    if not pool:
-        pool = live_models
+free_models = [m for m in live_models if m["free"]]
+if free_models:
+    pool = free_models
     labels = {m["id"]: m["label"] for m in pool}
-    live_ids = {m["id"] for m in live_models}
+    live_ids = {m["id"] for m in free_models}
     # 内置推荐模型排在最前，其余按名称排序
     ordered = [m for m in [DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS if m in labels]
     ordered = list(dict.fromkeys(ordered)) + sorted(i for i in labels if i not in ordered)
@@ -803,7 +801,7 @@ if live_models:
 else:
     labels = {m: m for m in FALLBACK_FREE_MODELS}
     ordered = list(dict.fromkeys([DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS))
-    st.sidebar.caption("⚠️ 未能获取在线模型列表，已显示内置列表。")
+    st.sidebar.caption("⚠️ 未能获取在线免费模型列表，已显示内置免费模型。")
 
 options = ordered + [MODEL_CUSTOM]
 default_idx = options.index(DEFAULT_OPENROUTER_MODEL) if DEFAULT_OPENROUTER_MODEL in options else 0
@@ -812,13 +810,16 @@ choice = st.sidebar.selectbox(
     options=options,
     index=default_idx,
     format_func=lambda x: x if x == MODEL_CUSTOM else labels.get(x, x),
-    help="列表来自 OpenRouter 在线模型库（数字为上下文长度）。首选模型失败时会自动切换到备用模型。",
+    help="仅列出 OpenRouter 的免费模型（数字为上下文长度）。首选模型失败时会自动切换到备用模型。",
 )
 if choice == MODEL_CUSTOM:
     openrouter_model = st.sidebar.text_input(
-        "自定义模型 ID", value=DEFAULT_OPENROUTER_MODEL,
+        "自定义模型 ID（仅限免费模型）", value=DEFAULT_OPENROUTER_MODEL,
         placeholder="例如：provider/model-name:free",
     ).strip() or DEFAULT_OPENROUTER_MODEL
+    if not (openrouter_model.endswith(":free") or openrouter_model == "openrouter/free"):
+        st.sidebar.warning("仅支持免费模型（ID 以 :free 结尾），已改用默认模型。")
+        openrouter_model = DEFAULT_OPENROUTER_MODEL
 else:
     openrouter_model = choice
 
