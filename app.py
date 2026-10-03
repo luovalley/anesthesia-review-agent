@@ -15,7 +15,7 @@ from openai import OpenAI
 
 # set_page_config 必须是第一个 Streamlit 命令
 st.set_page_config(
-    page_title="麻醉学全网文献热点追踪与 5000 字知识更新综述系统",
+    page_title="麻醉学全网文献热点追踪与知识更新综述系统",
     page_icon="💉",
     layout="wide",
 )
