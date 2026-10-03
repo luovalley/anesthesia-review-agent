@@ -7,3 +7,4 @@ requests
 pypdf
 python-docx
 python-dotenv
+aiohttp
