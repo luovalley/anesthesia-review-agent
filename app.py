@@ -14,7 +14,7 @@ from openai import OpenAI
 
 # set_page_config 必须是第一个 Streamlit 命令
 st.set_page_config(
-    page_title="麻醉学全网文献热点追踪与 5000 字知识更新综述系统",
+    page_title="麻醉学全网文献热点追踪与知识更新综述系统",
     page_icon="💉",
     layout="wide",
 )
@@ -73,6 +73,18 @@ STRETCH = {"width": "stretch"} if _ver >= (1, 49) else {"use_container_width": T
 
 # 2. 权威临床与科研核心主题映射字典（共 33 项）
 # ==========================================
+# 药物自动识别：按 WHO 国际非专利药名（INN）的词干规则匹配，而不是写死具体药名。
+# 例：-caine(局麻药)、-flurane(吸入麻醉药)、-zolam(苯二氮䓬)、-tomidine(α2激动剂)、
+#     -fentanil/-fentanyl(阿片)、-ofol(丙泊酚类)、-curonium/-curium(肌松药)、-setron(止吐药) 等。
+DRUG_STEMS = (
+    "caine", "flurane", "zolam", "tomidine", "tomidate", "fentanil", "fentanyl",
+    "ofol", "curonium", "curium", "ketamine", "setron", "phine", "morphone", "adol",
+    "stigmine", "gammadex", "methasone", "rolac", "profen", "phrine", "drine",
+    "olol", "pentin", "galin", "pental", "barbital", "trexone", "oxone",
+)
+DRUG_PATTERN = r"\b[a-z]*(?:" + "|".join(DRUG_STEMS) + r")\b"
+DRUG_EXCLUDE = {"curium", "josephine", "delphine"}  # 元素“锔”及常见人名，非药物
+
 CLINICAL_TOPICS = {
     "术中低血压 (Intraoperative Hypotension)": (
         r"\b(intraoperative hypotension|hypotension|low blood pressure)\b"
@@ -108,9 +120,7 @@ CLINICAL_TOPICS = {
         r"\b(multimodal analgesia|opioid-sparing|postoperative pain|chronic"
         r" pain|analgesic)\b"
     ),
-    "麻醉药物 (Dexmedetomidine / Propofol etc.)": (
-        r"\b(dexmedetomidine|propofol|remimazolam|sevoflurane|ketamine|ropivacaine)\b"
-    ),
+    "麻醉药物 (Anesthetic drugs)": DRUG_PATTERN,
     "人工智能/机器学习应用 (AI in Anesthesia)": (
         r"\b(artificial intelligence|machine learning|deep learning|predictive"
         r" model|algorithm)\b"
@@ -208,6 +218,37 @@ CLINICAL_TOPICS = {
 def extract_clinical_topics(text):
     text_lower = str(text).lower()
     return [name for name, pat in CLINICAL_TOPICS.items() if re.search(pat, text_lower)]
+
+
+def extract_hot_drugs(df, top_n=15):
+    """从当前文献集（本地 + 全网 + PubMed）的标题与摘要中自动提取被讨论最多的药物。"""
+    cols = ["药物", "涉及文献数", "占比", "总提及次数"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+
+    texts = (
+        df["Title"].fillna("").astype(str) + " " + df["Abstract"].fillna("").astype(str)
+    ).str.lower()
+    doc_freq, mentions = Counter(), Counter()
+    for text in texts:
+        found = [
+            w for w in re.findall(DRUG_PATTERN, text)
+            if len(w) >= 6 and w not in DRUG_EXCLUDE
+        ]
+        doc_freq.update(set(found))   # 每篇文献只计一次，避免长摘要刷屏
+        mentions.update(found)
+
+    rows = [
+        {
+            "药物": drug.capitalize(),
+            "涉及文献数": n,
+            "占比": f"{n / len(df):.0%}",
+            "总提及次数": mentions[drug],
+        }
+        for drug, n in doc_freq.items()
+    ]
+    rows.sort(key=lambda r: (-r["涉及文献数"], -r["总提及次数"], r["药物"]))
+    return pd.DataFrame(rows[:top_n], columns=cols)
 
 
 def get_past_5_years_range():
@@ -537,6 +578,14 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
                 )
 
         combined_input = local_text + web_text
+
+        hot_drugs = extract_hot_drugs(
+            pd.concat([local_df, web_df], ignore_index=True), top_n=10
+        )
+        if not hot_drugs.empty:
+            combined_input += "\n=== [自动统计：当前文献集中被讨论最多的药物（按涉及文献数）] ===\n"
+            for _, r in hot_drugs.iterrows():
+                combined_input += f"- {r['药物']}：{r['涉及文献数']} 篇文献（占 {r['占比']}）\n"
         start, today = get_past_5_years_range()
 
         prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
@@ -577,7 +626,8 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 ### ⚠️ 输出格式严格约束：
 1. 必须完整输出完所有的 7 个章节，**特别是“六、临床转化表格”和“七、总结与展望”必须完整撰写完，绝对不能中途截断**！
 2. 请使用标准 Markdown 格式，语言专业严谨。
-3. 引用文献时只能使用上方【背景资料】中实际出现的文献（标注 PMID 或链接）；严禁编造文献、作者、数据或 PMID。资料不足之处请明确说明“现有资料未覆盖”。
+3. 涉及药物的论述请优先围绕背景资料末尾“自动统计”中最热门的药物展开，并说明它们为何成为讨论热点。
+4. 引用文献时只能使用上方【背景资料】中实际出现的文献（标注 PMID 或链接）；严禁编造文献、作者、数据或 PMID。资料不足之处请明确说明“现有资料未覆盖”。
 """
 
         messages = [
@@ -906,5 +956,26 @@ with tab3:
             st.plotly_chart(fig, **STRETCH)
         else:
             st.info("未发现匹配的预设热点。")
+
+        st.markdown("---")
+        st.subheader("💊 当前文献集中讨论最热门的药物（自动提取）")
+        st.caption(
+            "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
+            "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
+        )
+        hot_df = extract_hot_drugs(all_docs, top_n=15)
+        if not hot_df.empty:
+            fig2 = px.bar(
+                hot_df, x="涉及文献数", y="药物", orientation="h",
+                color="涉及文献数", color_continuous_scale="Blues",
+            )
+            fig2.update_layout(
+                yaxis=dict(autorange="reversed"),
+                height=max(350, len(hot_df) * 30),
+            )
+            st.plotly_chart(fig2, **STRETCH)
+            st.dataframe(hot_df, hide_index=True, **STRETCH)
+        else:
+            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
     else:
         st.info("暂无文献数据。")
