@@ -622,6 +622,39 @@ def fetch_openrouter_models():
 MAX_CONTINUATIONS = 4  # 单次最多自动续写次数
 
 
+def strip_citation_marks(text):
+    """兜底清理：去掉正文中残留的参考文献标号（[1]、[1,2]、【文献3】、(PMID: xxx)、上标数字、括号网址等）。"""
+    if not text:
+        return text
+    pats = [
+        # 【本地文献 3】【全网/PubMed 文献 5】[文献2] [Ref 3] 等带标签的标号
+        r"[【\[［]\s*(?:本地|全网|PubMed|文献|来源|参考文献|Refs?\.?|References?|Sources?)[^】\]］\n]{0,30}?\d+[^】\]］\n]{0,10}[】\]］]",
+        # [1] [1,2] [1-3] [1][2]（含全角/中文括号）
+        r"[\[［【]\s*\d+(?:\s*[-–—~,，、;；]\s*\d+)*\s*[\]］】]",
+        # (PMID: 12345678) / （PMID：123，456）
+        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,，;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
+        # 括号里只有网址
+        r"[（(]\s*https?://[^\s)）]+\s*[）)]",
+        # 裸露的 PMID: 12345678
+        r"[,，;；]?\s*PMID\s*[:：]?\s*\d{5,9}",
+        # 上标数字 ¹²³ 与 ^[1]
+        r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+",
+        r"\^\s*\[?\d+(?:\s*[,，-]\s*\d+)*\]?",
+    ]
+    for p in pats:
+        text = re.sub(p, "", text, flags=re.IGNORECASE)
+    # 正文中直接写“本地文献 3 / 全网/PubMed 文献 5”之类的，改为中性说法
+    text = re.sub(
+        r"(?:本地文献|全网/PubMed\s*文献|全网文献|PubMed\s*文献)\s*\d+(?:\s*[-–—~,，、和与及]\s*\d+)*",
+        "相关研究",
+        text,
+    )
+    # 清理因删除产生的多余空格与标点前空白（不动换行，保护 Markdown 表格）
+    text = re.sub(r"[ \t]+([，。；：、,.;:）)])", r"\1", text)
+    text = re.sub(r"[（(]\s*[）)]", "", text)
+    return text
+
+
 def call_with_continuation(client, primary_model, messages, temperature=0.3):
     """调用模型；若因长度上限被截断（finish_reason == "length"），自动让模型接着写并拼接。"""
     text, used_model, finish = call_openrouter_with_fallback(
@@ -646,7 +679,7 @@ def call_with_continuation(client, primary_model, messages, temperature=0.3):
             client, used_model, cont_messages, temperature
         )
         text += more
-    return text, used_model, finish
+    return strip_citation_marks(text), used_model, finish
 
 
 def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df):
@@ -727,13 +760,14 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 1. 必须完整输出完所有的 7 个章节，**特别是“六、临床转化表格”和“七、总结与展望”必须完整撰写完，绝对不能中途截断**！
 2. 请使用标准 Markdown 格式，语言专业严谨。
 3. 涉及药物的论述请优先围绕背景资料末尾“自动统计”中最热门的药物展开，并说明它们为何成为讨论热点。
-4. 引用文献时只能使用上方【背景资料】中实际出现的文献（标注 PMID 或链接）；严禁编造文献、作者、数据或 PMID。资料不足之处请明确说明“现有资料未覆盖”。
+4. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID；资料不足之处请明确说明“现有资料未覆盖”。
+5. **正文中严禁出现任何参考文献标号或文献标识**：不得出现 [1]、[1,2]、[1-3]、上标数字、“【本地文献 3】”“全网/PubMed 文献 5”、PMID、网址、“文献3”等；背景资料中的编号仅供你内部参照，不得写入文章。需要提及研究时，请直接用自然语言叙述（如“近期的随机对照试验显示……”），也不要在文末附带带编号的参考文献列表。
 """
 
         messages = [
             {
                 "role": "system",
-                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且不得编造参考文献。",
+                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，不得编造参考文献，且正文中绝不出现任何参考文献标号（如 [1]、PMID、文献编号）。",
             },
             {"role": "user", "content": prompt},
         ]
@@ -772,14 +806,14 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
         directive = (
             "请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
             "（保持 7 个章节结构与 Markdown 表格，不得省略、缩写或中途截断；"
-            "只能引用背景资料中出现的文献，严禁编造；直接输出文章，不要额外解释）。\n\n"
+            "只能依据背景资料中的文献，严禁编造；正文中不得出现任何参考文献标号、PMID 或文献编号；直接输出文章，不要额外解释）。\n\n"
             f"修改意见：{user_text}"
         )
         temperature = 0.3
     else:
         directive = (
             "请基于上述综述与背景资料回答下面的问题，简明准确，不要重写全文；"
-            "只能依据背景资料中的文献，严禁编造，资料不足请直说。\n\n"
+            "只能依据背景资料中的文献，严禁编造，资料不足请直说；回答中不要出现文献编号或 PMID。\n\n"
             f"问题：{user_text}"
         )
         temperature = 0.4
