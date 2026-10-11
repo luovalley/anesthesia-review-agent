@@ -47,7 +47,7 @@ NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
 ENV_TAVILY_KEY = normalize_key(os.getenv("TAVILY_API_KEY", ""))
 ENV_OPENROUTER_KEY = normalize_key(os.getenv("OPENROUTER_API_KEY", ""))
 
-# 邮箱改为从环境变量读取，不再把个人邮箱写死在公开代码里
+# 邮箱改为从环境变量读取
 Entrez.email = NCBI_EMAIL or None
 Entrez.api_key = NCBI_API_KEY or None
 
@@ -63,9 +63,8 @@ FALLBACK_FREE_MODELS = [
 ]
 
 DOC_COLUMNS = ["PMID/URL", "Title", "Abstract", "Year", "Source"]
-TAVILY_MAX_RESULTS = 20  # Tavily 接口上限为 20
+TAVILY_MAX_RESULTS = 20
 
-# st.dataframe / st.plotly_chart 的撑满宽度参数在新旧版本中不同
 try:
     _ver = tuple(int(x) for x in st.__version__.split(".")[:2])
 except Exception:
@@ -77,13 +76,13 @@ STRETCH = {"width": "stretch"} if _ver >= (1, 49) else {"use_container_width": T
 # 访问密码保护
 # ==========================================
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
-MAX_FAILS = 5      # 窗口期内允许的最大错误次数
-LOCK_WINDOW = 600  # 窗口期（秒）
+MAX_FAILS = 5
+LOCK_WINDOW = 600
 
 
 @st.cache_resource
 def _login_tracker():
-    return {"fails": []}  # 全部访客共享，用于防止暴力猜密码
+    return {"fails": []}
 
 
 def require_password():
@@ -119,7 +118,7 @@ def require_password():
             st.rerun()
         else:
             tracker["fails"].append(time.time())
-            time.sleep(1)  # 拖慢连续猜测
+            time.sleep(1)
             st.error("密码错误。")
     st.stop()
 
@@ -127,8 +126,6 @@ def require_password():
 require_password()
 
 # 2. 权威临床与科研核心主题映射字典（共 33 项）
-# ==========================================
-# 药物自动识别：按 WHO 国际非专利药名（INN）的词干规则匹配，而不是写死具体药名。
 DRUG_STEMS = (
     "caine", "flurane", "zolam", "tomidine", "tomidate", "fentanil", "fentanyl",
     "ofol", "curonium", "curium", "ketamine", "setron", "phine", "morphone", "adol",
@@ -136,7 +133,7 @@ DRUG_STEMS = (
     "olol", "pentin", "galin", "pental", "barbital", "trexone", "oxone",
 )
 DRUG_PATTERN = r"\b[a-z]*(?:" + "|".join(DRUG_STEMS) + r")\b"
-DRUG_EXCLUDE = {"curium", "josephine", "delphine"}  # 元素“锔”及常见人名，非药物
+DRUG_EXCLUDE = {"curium", "josephine", "delphine"}
 
 CLINICAL_TOPICS = {
     "术中低血压 (Intraoperative Hypotension)": (
@@ -274,7 +271,6 @@ def extract_clinical_topics(text):
 
 
 def extract_hot_drugs(df, top_n=15):
-    """从当前文献集（本地 + 全网 + PubMed）的标题与摘要中自动提取被讨论最多的药物。"""
     cols = ["药物", "涉及文献数", "占比", "总提及次数"]
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
@@ -288,7 +284,7 @@ def extract_hot_drugs(df, top_n=15):
             w for w in re.findall(DRUG_PATTERN, text)
             if len(w) >= 6 and w not in DRUG_EXCLUDE
         ]
-        doc_freq.update(set(found))   # 每篇文献只计一次
+        doc_freq.update(set(found))
         mentions.update(found)
 
     rows = [
@@ -320,14 +316,13 @@ def get_past_5_years_date_filter():
 
 
 def doc_link(identifier):
-    """把 PMID/URL 转成可访问链接；本地文件返回 (None, 显示文字)。"""
     ident = str(identifier or "").strip()
     if ident.upper().startswith("PMID:"):
         pmid = ident.split(":", 1)[1].strip()
         return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", f"PMID:{pmid}"
     if ident.lower().startswith(("http://", "https://")):
         return ident, ident
-    if ident.isdigit():  # CSV 中的纯数字 PMID
+    if ident.isdigit():
         return f"https://pubmed.ncbi.nlm.nih.gov/{ident}/", f"PMID:{ident}"
     return None, "本地上传文件（无在线链接）"
 
@@ -338,7 +333,6 @@ def _md_escape(text):
 
 
 def build_literature_markdown(df):
-    """生成 Markdown 文献清单：标题（可点击）、年份、PMID/URL。"""
     lines = []
     for i, (_, row) in enumerate(df.iterrows(), 1):
         url, shown = doc_link(row.get("PMID/URL"))
@@ -354,7 +348,7 @@ def clean_search_keyword(raw_text):
     if not raw_text:
         return "Anesthesia"
     text = re.sub(r"\.(pdf|docx|txt|csv)$", "", raw_text, flags=re.IGNORECASE)
-    text = re.sub(r"[₂—–-]", " ", text)
+    text = re.sub(r"[_—–-]", " ", text)
     text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
     words = [w for w in text.split() if len(w) > 2]
     return " ".join(words[:4]) if words else "Anesthesia"
@@ -619,9 +613,9 @@ def strip_citation_marks(text):
     pats = [
         r"[【\[［]\s*(?:本地\vert{}全网\vert{}PubMed\vert{}文献\vert{}来源\vert{}参考文献\vert{}Refs?\.?\vert{}References?\vert{}Sources?)[^】\]］\n]{0,30}?\d+[^】\]］\n]{0,10}[】\]］]",
         r"[\[［【]\s*\d+(?:\s*[-–—~,，、;；]\s*\d+)*\s*[\]］】]",
-        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,$,;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
+        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,，;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
         r"[（(]\s*https?://[^\s)）]+\s*[）)]",
-        r",?s*PMID\s*[:：]?\s*\d{5,9}",
+        r",?\s*PMID\s*[:：]?\s*\d{5,9}",
         r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+",
         r"\^\s*\[?\d+(?:\s*[,，-]\s*\d+)*\]?",
     ]
@@ -701,7 +695,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
                 combined_input += f"- {r['药物']}：{r['涉及文献数']} 篇文献（占 {r['占比']}）\n"
         start, today = get_past_5_years_range()
 
-        # Glossary 规范拼接
+        # Glossary 规范拼接（方案 B 列表形式）
         glossary_section = ""
         if glossary_text.strip():
             glossary_section = f"""
@@ -850,18 +844,26 @@ work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2])
 
 st.sidebar.markdown("---")
 st.sidebar.header("📖 专业术语表 (Glossary)")
+
+# 自动尝试加载同目录下的 glossary.md 文件
+default_glossary_content = ""
+if os.path.exists("glossary.md"):
+    try:
+        with open("glossary.md", "r", encoding="utf-8") as f:
+            default_glossary_content = f.read()
+    except Exception:
+        pass
+
 glossary_input = st.sidebar.text_area(
-    "输入自定义 Glossary（支持 Markdown 表格或列表）：",
-    value="",
-    height=130,
+    "输入或修改自定义 Glossary（支持列表/键值对）：",
+    value=default_glossary_content,
+    height=150,
     placeholder=(
         "例如：\n"
-        "| 英文 | 中文 |\n"
-        "| --- | --- |\n"
-        "| Intraoperative Hypotension | 术中低血压 |\n"
-        "| Sugammadex | 舒更葡糖钠 |"
+        "- Intraoperative Hypotension: 术中低血压\n"
+        "- Sugammadex: 舒更葡糖钠"
     ),
-    help="在此填入的专业术语将在 AI 生成与翻译时被严格遵守。",
+    help="已自动从仓库中的 glossary.md 加载，你也可以在这里直接修改或补充[cite: 2]。",
 )
 
 st.sidebar.markdown("---")
