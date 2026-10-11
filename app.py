@@ -377,22 +377,14 @@ def build_literature_markdown(df):
 
 
 def clean_search_keyword(raw_text):
-    """
-    【升级版关键词提取】
-    不仅过滤文件名，还支持直接从文件正文或长标题中提取最核心的英文名词、医学术语组合，
-    确保检索词与上传的文献内容高度一致。
-    """
     if not raw_text:
         return "Anesthesia"
     
-    # 如果传入的是整篇文献内容/摘要（多行文本），优先提取关键医学词汇
     if len(raw_text) > 50 or "\n" in raw_text:
-        # 尝试提取类似 Keywords 后面的词，或者提取前几个具有代表性的医学英文名词组合
         kw_match = re.search(r"keywords\s*[:：]\s*([^\n]+)", raw_text, re.IGNORECASE)
         if kw_match:
             raw_text = kw_match.group(1)
         else:
-            # 提取英文长标题或摘要前 150 个字符中的英文单词
             clean_snippet = re.sub(r"[^a-zA-Z\s]", " ", raw_text[:300])
             words = [w for w in clean_snippet.split() if len(w) > 3 and w.lower() not in {"the", "and", "for", "with", "from", "this", "that"}]
             if words:
@@ -452,7 +444,6 @@ def parse_uploaded_files(uploaded_files):
                     })
                 continue
 
-            # 尝试从文本正文中提取第一行作为标题，其余作为摘要
             lines = [l.strip() for l in abstract.splitlines() if l.strip()]
             doc_title = filename
             if lines and len(lines[0]) > 10 and not lines[0].startswith("PMID"):
@@ -696,7 +687,7 @@ def strip_citation_marks(text):
         "相关研究",
         text,
     )
-    text = re.sub(r"[ \t]+([,[，。；：、;；）)])", r"\1", text)
+    text = re.sub(r"[ \t]+([,[,，。；：、;；）)])", r"\1", text)
     text = re.sub(r"[（(]\s*[）)]", "", text)
     return text
 
@@ -736,21 +727,19 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 
         local_text = ""
         if not local_df.empty:
-            local_text += "\n=== [来源1：用户上传的本地文献资料] ===\n"
+            local_text += "\n=== [本地文献资料] ===\n"
             for i, (_, row) in enumerate(local_df.head(20).iterrows(), 1):
                 local_text += (
-                    f"【本地文献 {i}】标题: {row.get('Title', '')}\n"
+                    f"文献标题: {row.get('Title', '')}\n"
                     f"摘要/内容: {str(row.get('Abstract', ''))[:800]}...\n\n"
                 )
 
         web_text = ""
         if not web_df.empty:
-            web_text += "\n=== [来源2：全网（Tavily + PubMed）近5年高相关度文献] ===\n"
+            web_text += "\n=== [全网及PubMed文献资料] ===\n"
             for i, (_, row) in enumerate(web_df.head(30).iterrows(), 1):
                 web_text += (
-                    f"【全网/PubMed 文献 {i}】来源: {row.get('Source', '')} | "
-                    f"标识: {row.get('PMID/URL', '')} | "
-                    f"标题: {row.get('Title', '')} ({row.get('Year', '')})\n"
+                    f"文献标题: {row.get('Title', '')} ({row.get('Year', '')})\n"
                     f"摘要: {str(row.get('Abstract', ''))[:500]}...\n\n"
                 )
 
@@ -760,9 +749,9 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             pd.concat([local_df, web_df], ignore_index=True), top_n=10
         )
         if not hot_drugs.empty:
-            combined_input += "\n=== [自动统计：当前文献集中被讨论最多的药物（按涉及文献数）] ===\n"
+            combined_input += "\n=== [自动统计：当前文献集中被讨论最多的药物] ===\n"
             for _, r in hot_drugs.iterrows():
-                combined_input += f"- {r['药物']}：{r['涉及文献数']} 篇文献（占 {r['占比']}）\n"
+                combined_input += f"- {r['药物']}：涉及 {r['涉及文献数']} 篇文献\n"
         start, today = get_past_5_years_range()
 
         glossary_section = ""
@@ -811,18 +800,17 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 
 ---
 
-### ⚠️ 输出格式严格约束：
+### ⚠️ 输出格式极其严格的约束（切记）：
 1. 必须完整输出完所有的 7 个章节，**特别是“六、临床转化表格”和“七、总结与展望”必须完整撰写完，绝对不能中途截断**！
 2. 请使用标准 Markdown 格式，语言专业严谨。
-3. 涉及药物的论述请优先围绕背景资料末尾“自动统计”中最热门的药物展开，并说明它们为何成为讨论热点。
+3. **绝对禁止在正文中出现任何形式的文献序号、标号或标记**：包括但不限于 `[1]`、`[1,2]`、`[1-3]`、上标数字、或者任何形式的“文献1”、“本地文献”、“全网文献”、“PMID”等引用标识。正文表述文献时，必须完全采用无序号的自然语言学术叙述（例如：“多项临床研究显示……”、“近期关于衰弱评估的试验表明……”）。
 4. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID；资料不足之处请明确说明“现有资料未覆盖”。
-5. **正文中严禁出现任何参考文献标号或文献标识**：不得出现 [1]、[1,2]、[1-3]、上标数字、“【本地文献 3】”“全网/PubMed 文献 5”、PMID、网址、“文献3”等；背景资料中的编号仅供你内部参照，不得写入文章。需要提及研究时，请直接用自然语言叙述（如“近期的随机对照试验显示……”），也不要在文末附带带编号的参考文献列表。
 """
 
         messages = [
             {
                 "role": "system",
-                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，不得编造参考文献，且正文中绝不出现任何参考文献标号（如 [1]、PMID、文献编号）。",
+                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号（如 [1]、[2]、文献1）。",
             },
             {"role": "user", "content": prompt},
         ]
@@ -868,7 +856,7 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
         directive = (
             f"请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
             f"(保持 7 个章节结构与 Markdown 表格，不得省略、缩写或中途截断；"
-            f"只能依据背景资料中的文献，严禁编造；正文中不得出现任何参考文献标号、PMID 或文献编号；直接输出文章，不要额外解释)。"
+            f"只能依据背景资料中的文献，严禁编造；**正文中严禁出现任何形式的参考文献序号、标号、PMID 或文献编号**；直接输出文章，不要额外解释)。"
             f"{glossary_directive}\n\n"
             f"修改意见：{user_text}"
         )
@@ -914,16 +902,13 @@ st.markdown(
     "一键撰写包含**核心争论、临床建议表格与未来方向**的学术综述。"
 )
 
-# ----------------- 顶部：退出登录与绿色的专业词典加载成功提示 -----------------
 render_auth_header()
 
-# ----------------- ⚙️ 配置面板 -----------------
 st.sidebar.header("⚙️ 配置面板")
 work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2], index=0)
 
 st.sidebar.markdown("---")
 
-# ----------------- 🔑 API Key 设置 -----------------
 st.sidebar.header("🔑 API Key 设置")
 _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
 
@@ -977,7 +962,6 @@ else:
 
 st.sidebar.markdown("---")
 
-# ----------------- 选项与滑块 -----------------
 enable_glossary_checkbox = st.sidebar.checkbox("启用麻醉学专业术语动态对齐", value=True)
 
 max_doc_count = st.sidebar.slider(
@@ -987,7 +971,6 @@ max_doc_count = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 
-# ----------------- 模式对应输入（支持上传本地文献与提取主题） -----------------
 local_df = pd.DataFrame(columns=DOC_COLUMNS)
 search_topic = ""
 
@@ -1008,7 +991,6 @@ if work_mode == MODE_1:
     if custom_topic.strip():
         search_topic = custom_topic.strip()
     elif not local_df.empty:
-        # 【核心改进】：优先从上传文件的摘要或正文中提取关键词进行检索
         combined_content = " ".join(local_df["Abstract"].tolist() + local_df["Title"].tolist())
         search_topic = clean_search_keyword(combined_content)
 else:
@@ -1036,7 +1018,6 @@ if not search_topic:
 web_df = ss["web_df"]
 review_topic = ss["searched_topic"] or search_topic
 
-# ----------------- 主界面设计 -----------------
 st.markdown("### 📊 当前数据准备状态")
 c1, c2, c3 = st.columns(3)
 c1.metric("解析本地文献数", f"{len(local_df)} 篇")
@@ -1214,5 +1195,19 @@ with tab3:
             "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
             "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
         )
+        hot_df = extract_hot_drugs(all_docs, top_n=15)
+        if not hot_df.empty:
+            fig2 = px.bar(
+                hot_df, x="涉及文献数", y="药物", orientation="h",
+                color="涉及文献数", color_continuous_scale="Blues",
+            )
+            fig2.update_layout(
+                yaxis=dict(autorange="reversed"),
+                height=max(350, len(hot_df) * 30),
+            )
+            st.plotly_chart(fig2, **STRETCH)
+            st.dataframe(hot_df, hide_index=True, **STRETCH)
+        else:
+            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
     else:
-        st.info("暂无文献数据。")
+    ...
