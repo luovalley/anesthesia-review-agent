@@ -377,13 +377,32 @@ def build_literature_markdown(df):
 
 
 def clean_search_keyword(raw_text):
+    """
+    【升级版关键词提取】
+    不仅过滤文件名，还支持直接从文件正文或长标题中提取最核心的英文名词、医学术语组合，
+    确保检索词与上传的文献内容高度一致。
+    """
     if not raw_text:
         return "Anesthesia"
+    
+    # 如果传入的是整篇文献内容/摘要（多行文本），优先提取关键医学词汇
+    if len(raw_text) > 50 or "\n" in raw_text:
+        # 尝试提取类似 Keywords 后面的词，或者提取前几个具有代表性的医学英文名词组合
+        kw_match = re.search(r"keywords\s*[:：]\s*([^\n]+)", raw_text, re.IGNORECASE)
+        if kw_match:
+            raw_text = kw_match.group(1)
+        else:
+            # 提取英文长标题或摘要前 150 个字符中的英文单词
+            clean_snippet = re.sub(r"[^a-zA-Z\s]", " ", raw_text[:300])
+            words = [w for w in clean_snippet.split() if len(w) > 3 and w.lower() not in {"the", "and", "for", "with", "from", "this", "that"}]
+            if words:
+                return " ".join(words[:5])
+
     text = re.sub(r"\.(pdf|docx|txt|csv)$", "", raw_text, flags=re.IGNORECASE)
     text = re.sub(r"[_—–-]", " ", text)
     text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
     words = [w for w in text.split() if len(w) > 2]
-    return " ".join(words[:4]) if words else "Anesthesia"
+    return " ".join(words[:5]) if words else "Anesthesia"
 
 
 def english_part(topic):
@@ -433,9 +452,15 @@ def parse_uploaded_files(uploaded_files):
                     })
                 continue
 
+            # 尝试从文本正文中提取第一行作为标题，其余作为摘要
+            lines = [l.strip() for l in abstract.splitlines() if l.strip()]
+            doc_title = filename
+            if lines and len(lines[0]) > 10 and not lines[0].startswith("PMID"):
+                doc_title = lines[0]
+
             data.append({
                 "PMID/URL": f"LOCAL_{idx}",
-                "Title": filename,
+                "Title": doc_title,
                 "Abstract": abstract or "未能解析出有效正文",
                 "Year": "本地文件",
                 "Source": "上传文件",
@@ -565,7 +590,6 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
 # 5. AI 综述生成引擎与云端自动存储
 # ==========================================
 def save_review_to_cloud(topic, content, tag="V1"):
-    """自动将综述保存到服务器本地的 saved_reviews 目录中"""
     os.makedirs("saved_reviews", exist_ok=True)
     safe_name = re.sub(r'[\\/:*?"<>|]', "_", topic)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -807,10 +831,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             client, model_name, messages, temperature=0.3
         )
         wrapped = wrap_article(result, used_model, finish)
-        
-        # 自动保存到云端服务器文件夹
         save_review_to_cloud(topic_keywords, wrapped, tag="V1")
-        
         return wrapped, result, messages
     except Exception as e:
         return f"❌ 深度综述生成失败: {e}", None, None
@@ -966,7 +987,7 @@ max_doc_count = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 
-# ----------------- 模式对应输入（支持上传本地文献与补充主题） -----------------
+# ----------------- 模式对应输入（支持上传本地文献与提取主题） -----------------
 local_df = pd.DataFrame(columns=DOC_COLUMNS)
 search_topic = ""
 
@@ -986,8 +1007,10 @@ if work_mode == MODE_1:
 
     if custom_topic.strip():
         search_topic = custom_topic.strip()
-    elif uploaded_files:
-        search_topic = clean_search_keyword(uploaded_files[0].name.rsplit(".", 1)[0])
+    elif not local_df.empty:
+        # 【核心改进】：优先从上传文件的摘要或正文中提取关键词进行检索
+        combined_content = " ".join(local_df["Abstract"].tolist() + local_df["Title"].tolist())
+        search_topic = clean_search_keyword(combined_content)
 else:
     selected_preset = st.sidebar.selectbox(
         "💡 从 33 项权威热点词库中选择：",
@@ -1002,7 +1025,7 @@ else:
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🔍 开始检索文献", type="primary", disabled=not search_topic):
-    with st.spinner(f"正在全网（Tavily + PubMed）检索【{search_topic}】近 5 年文献..."):
+    with st.spinner(f"正在全网（Tavily + PubMed）检索与【{search_topic}】相关的近 5 年文献..."):
         ss["web_df"], ss["search_msgs"] = fetch_web_and_pubmed_literature(
             search_topic, tavily_api_key, max_doc_count
         )
@@ -1038,7 +1061,6 @@ with tab1:
         "探讨学术争论并输出临床转化表格。生成后会自动保存在服务器云端。"
     )
 
-    # 增加一个云端历史文件查看器
     if os.path.exists("saved_reviews"):
         cloud_files = sorted([f for f in os.listdir("saved_reviews") if f.endswith(".md")], reverse=True)
         if cloud_files:
@@ -1141,8 +1163,6 @@ with tab1:
                         ss["current_raw"] = reply
                         ss["qa_history"].append({"role": "user", "content": f"✏️ 修改：{user_text.strip()}"})
                         ss["qa_history"].append({"role": "assistant", "content": f"已按要求生成第 {n} 版全文（见上方“查看版本”）。"})
-                        
-                        # 每次修改版本也自动保存到云端服务器文件夹
                         save_review_to_cloud(ss["article_topic"], new_text, tag=f"V{n}")
                     else:
                         ss["qa_history"].append({"role": "user", "content": f"💬 提问：{user_text.strip()}"})
@@ -1194,19 +1214,5 @@ with tab3:
             "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
             "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
         )
-        hot_df = extract_hot_drugs(all_docs, top_n=15)
-        if not hot_df.empty:
-            fig2 = px.bar(
-                hot_df, x="涉及文献数", y="药物", orientation="h",
-                color="涉及文献数", color_continuous_scale="Blues",
-            )
-            fig2.update_layout(
-                yaxis=dict(autorange="reversed"),
-                height=max(350, len(hot_df) * 30),
-            )
-            st.plotly_chart(fig2, **STRETCH)
-            st.dataframe(hot_df, hide_index=True, **STRETCH)
-        else:
-            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
     else:
         st.info("暂无文献数据。")
