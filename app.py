@@ -625,7 +625,7 @@ def strip_citation_marks(text):
         "相关研究",
         text,
     )
-    text = re.sub(r"[ \t]+([[,。；：、,.;:）)])", r"\1", text)
+    text = re.sub(r"[ \t]+([，。；：、,.;:）)])", r"\1", text)
     text = re.sub(r"[（(]\s*[）)]", "", text)
     return text
 
@@ -655,7 +655,6 @@ def call_with_continuation(client, primary_model, messages, temperature=0.3):
     return strip_citation_marks(text), used_model, finish
 
 
-# 后台自动加载同目录下的 glossary.md 文件内容
 def load_glossary_content():
     if os.path.exists("glossary.md"):
         try:
@@ -666,7 +665,7 @@ def load_glossary_content():
     return ""
 
 
-def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df):
+def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df, enable_glossary=True):
     try:
         clean_key = str(api_key).strip()
         if not clean_key:
@@ -705,10 +704,11 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
                 combined_input += f"- {r['药物']}：{r['涉及文献数']} 篇文献（占 {r['占比']}）\n"
         start, today = get_past_5_years_range()
 
-        glossary_text = load_glossary_content()
         glossary_section = ""
-        if glossary_text.strip():
-            glossary_section = f"""
+        if enable_glossary:
+            glossary_text = load_glossary_content()
+            if glossary_text.strip():
+                glossary_section = f"""
 ---
 ### 📖 专业术语表 (Glossary) 严格对齐规范：
 请在撰写、总结或翻译专业名词时，**必须严格参照**以下专有名词对照表（Glossary）[cite: 2]。凡是表中出现的术语，其中文或英文译名必须与之一致，严禁出现与表不符的翻译：
@@ -789,16 +789,17 @@ ASK_MODE = "💬 提问讨论（不改动文章）"
 
 
 def follow_up_review(api_key, model_name, base_messages, current_article,
-                     qa_history, user_text, mode):
+                     qa_history, user_text, mode, enable_glossary=True):
     clean_key = str(api_key).strip()
     if not clean_key:
         raise RuntimeError("请填入有效的 OpenRouter API Key！")
     client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
 
-    glossary_text = load_glossary_content()
     glossary_directive = ""
-    if glossary_text.strip():
-        glossary_directive = f"\n请继续严格参照以下专业术语表 (Glossary)[cite: 2]：\n{glossary_text.strip()}\n"
+    if enable_glossary:
+        glossary_text = load_glossary_content()
+        if glossary_text.strip():
+            glossary_directive = f"\n请继续严格参照以下专业术语表 (Glossary)[cite: 2]：\n{glossary_text.strip()}\n"
 
     if mode == REVISE_MODE:
         directive = (
@@ -850,39 +851,39 @@ st.markdown(
     "一键撰写包含**核心争论、临床建议表格与未来方向**的学术综述。"
 )
 
-st.sidebar.header("🔍 模式设置与 Key 配置")
-work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2])
+# ----------------- 侧边栏配置面板与词典状态 -----------------
+glossary_content = load_glossary_content()
+term_count = len(re.findall(r"^\s*[\*\-]\s+.+?[—–-].+?$", glossary_content, re.MULTILINE))
+
+if glossary_content.strip():
+    st.sidebar.success(f"✅ 专业词典加载成功 (共收录 {term_count} 条核心术语)[cite: 5]")
+else:
+    st.sidebar.warning("⚠️ 未检测到 glossary.md 或词典为空")
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ 检索参数设置")
-max_doc_count = st.sidebar.slider(
-    "🔍 单次 PubMed / Tavily 检索最大文献数量（Tavily 最多 20 篇）：",
-    min_value=10, max_value=100, value=50, step=10,
-)
+st.sidebar.header("⚙️ 配置面板")
+work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔑 API Key 设置")
 _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
+openrouter_input = st.sidebar.text_input(
+    "API Key (OpenRouter / DeepSeek)",
+    value="", type="password", **_AC,
+    placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
+)
+_typed_or = normalize_key(openrouter_input)
+if _typed_or and not _typed_or.startswith("sk-or-"):
+    pass  # 支持其他平台 Key
+openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
+
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
     value="", type="password", **_AC,
     placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
 )
-openrouter_input = st.sidebar.text_input(
-    "OpenRouter API Key",
-    value="", type="password", **_AC,
-    placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
-)
 _typed_tavily = normalize_key(tavily_input)
-_typed_tavily_rejected = bool(_typed_tavily) and not _typed_tavily.startswith("tvly-")
-if _typed_tavily_rejected:
-    _typed_tavily = ""
 tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
-_typed_or = normalize_key(openrouter_input)
-if _typed_or and not _typed_or.startswith("sk-or-"):
-    st.sidebar.warning("OpenRouter Key 应以 sk-or- 开头，输入框内容已忽略，改用后台 Key。")
-    _typed_or = ""
-openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
 
 MODEL_CUSTOM = "✏️ 自定义模型 ID…"
 live_models = fetch_openrouter_models()
@@ -900,27 +901,29 @@ if free_models:
 else:
     labels = {m: m for m in FALLBACK_FREE_MODELS}
     ordered = list(dict.fromkeys([DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS))
-    st.sidebar.caption("⚠️ 未能获取在线免费模型列表，已显示内置免费模型。")
 
 options = ordered + [MODEL_CUSTOM]
 default_idx = options.index(DEFAULT_OPENROUTER_MODEL) if DEFAULT_OPENROUTER_MODEL in options else 0
 choice = st.sidebar.selectbox(
-    "首选 AI 模型",
+    "选择翻译大模型",
     options=options,
     index=default_idx,
     format_func=lambda x: x if x == MODEL_CUSTOM else labels.get(x, x),
-    help="仅列出 OpenRouter 的免费模型（数字为上下文长度）。首选模型失败时会自动切换到备用模型。",
 )
 if choice == MODEL_CUSTOM:
     openrouter_model = st.sidebar.text_input(
-        "自定义模型 ID（仅限免费模型）", value=DEFAULT_OPENROUTER_MODEL,
-        placeholder="例如：provider/model-name:free",
+        "自定义模型 ID", value=DEFAULT_OPENROUTER_MODEL,
     ).strip() or DEFAULT_OPENROUTER_MODEL
-    if not (openrouter_model.endswith(":free") or openrouter_model == "openrouter/free"):
-        st.sidebar.warning("仅支持免费模型（ID 以 :free 结尾），已改用默认模型。")
-        openrouter_model = DEFAULT_OPENROUTER_MODEL
 else:
     openrouter_model = choice
+
+st.sidebar.markdown("---")
+enable_glossary_checkbox = st.sidebar.checkbox("启用麻醉学专业术语动态对齐", value=True)
+
+max_doc_count = st.sidebar.slider(
+    "单次文本分块字符数 / 检索文献数量",
+    min_value=10, max_value=100, value=50, step=10,
+)
 
 if not NCBI_EMAIL:
     st.sidebar.caption("ℹ️ 未配置 NCBI_EMAIL，建议在 Secrets 中设置（NCBI 要求提供联系邮箱）。")
@@ -972,180 +975,4 @@ if not search_topic:
     st.sidebar.caption("👆 请先输入或选择一个主题（模式 1 也可直接上传文件）。")
 
 web_df = ss["web_df"]
-review_topic = ss["searched_topic"] or search_topic
-
-st.markdown("### 📊 当前数据准备状态")
-c1, c2, c3 = st.columns(3)
-c1.metric("解析本地文献数", f"{len(local_df)} 篇")
-c2.metric("全网/PubMed 关联文献", f"{len(web_df)} 篇")
-c3.metric("拟撰写综述主题", review_topic or "未指定")
-
-for level, text in ss["search_msgs"]:
-    getattr(st, level)(text)
-
-st.markdown("---")
-
-all_docs = pd.concat([local_df, web_df], ignore_index=True)
-
-tab1, tab2, tab3 = st.tabs(
-    ["📝 深度知识更新文章", "📚 数据库与全网文献明细", "🔥 课题热点图表"]
-)
-
-with tab1:
-    st.subheader("📝 AI 深度撰写：知识更新综述")
-    st.caption(
-        "系统将融合本地文献与全网学术搜索（Tavily）以及 PubMed 数据库近 5 年的研究，"
-        "探讨学术争论并输出临床转化表格。请先在侧边栏点击“开始检索文献”。"
-        "初稿生成后，可在文章下方多轮提问或提交修改意见。"
-    )
-
-    if st.button("🚀 撰写深度综述", type="primary"):
-        if not review_topic:
-            st.error("请先在左侧边栏输入或选择一个具体的综述主题！")
-        elif not openrouter_api_key:
-            st.error("请在侧边栏填入有效的 OpenRouter API Key！")
-        elif local_df.empty and web_df.empty:
-            st.warning("当前没有文献数据，请先点击“开始检索文献”或上传文件！")
-        else:
-            with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
-                display_text, raw_text, base_msgs = generate_5000_words_review(
-                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df
-                )
-            if raw_text is None:
-                st.error(display_text)
-            else:
-                ss["versions"] = [{"label": "V1 初稿", "text": display_text}]
-                ss["base_messages"] = base_msgs
-                ss["current_raw"] = raw_text
-                ss["qa_history"] = []
-                ss["article_topic"] = review_topic
-
-    if ss["versions"]:
-        st.markdown("---")
-        versions = ss["versions"]
-        if len(versions) > 1:
-            idx = st.selectbox(
-                "查看版本：", options=range(len(versions)),
-                index=len(versions) - 1,
-                format_func=lambda i: versions[i]["label"],
-            )
-        else:
-            idx = 0
-        shown = versions[idx]
-        st.markdown(shown["text"])
-
-        safe_name = re.sub(r'[\\/:*?"<>|]', "_", ss["article_topic"])
-        ver_tag = shown["label"].split()[0]
-        st.download_button(
-            label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
-            data=shown["text"],
-            file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
-            mime="text/markdown",
-        )
-
-        st.markdown("---")
-        st.subheader("💬 继续提问 / 提交修改意见")
-        st.caption("“修改”模式会基于最新版生成完整新版本并保留历史版本；“提问”模式只回答问题，不改动文章。")
-
-        for msg in ss["qa_history"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        with st.form("followup_form", clear_on_submit=True):
-            mode = st.radio("本次操作：", [REVISE_MODE, ASK_MODE], horizontal=True)
-            user_text = st.text_area(
-                "请输入内容：", height=120,
-                placeholder="修改示例：把第四章的争论部分扩写，并增加关于老年患者的讨论；"
-                            "提问示例：第六章表格中的肌松监测建议依据是什么？",
-            )
-            submitted = st.form_submit_button("提交", type="primary")
-
-        if submitted:
-            if not user_text.strip():
-                st.warning("请输入修改意见或问题。")
-            elif not openrouter_api_key:
-                st.error("请在侧边栏填入有效的 OpenRouter API Key！")
-            else:
-                spinner_txt = "AI 正在修订全文，请稍候..." if mode == REVISE_MODE else "AI 正在思考..."
-                try:
-                    with st.spinner(spinner_txt):
-                        reply, used_model, finish = follow_up_review(
-                            openrouter_api_key, openrouter_model, ss["base_messages"],
-                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode,
-                        )
-                    if mode == REVISE_MODE:
-                        n = len(ss["versions"]) + 1
-                        short = re.sub(r"\s+", " ", user_text.strip())[:12]
-                        ss["versions"].append({
-                            "label": f"V{n} {short}",
-                            "text": wrap_article(reply, used_model, finish),
-                        })
-                        ss["current_raw"] = reply
-                        ss["qa_history"].append({"role": "user", "content": f"✏️ 修改：{user_text.strip()}"})
-                        ss["qa_history"].append({"role": "assistant", "content": f"已按要求生成第 {n} 版全文（见上方“查看版本”）。"})
-                    else:
-                        ss["qa_history"].append({"role": "user", "content": f"💬 提问：{user_text.strip()}"})
-                        ss["qa_history"].append({"role": "assistant", "content": reply})
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ 处理失败: {e}")
-
-with tab2:
-    st.subheader("已调用的文献数据明细")
-    if not all_docs.empty:
-        lit_md = build_literature_markdown(all_docs)
-        st.caption(f"共 {len(all_docs)} 篇（点击标题或链接可直接访问）")
-        st.markdown(lit_md)
-        st.download_button(
-            label="📥 下载文献清单 (.md)",
-            data=f"# 文献清单：{review_topic or '未指定主题'}\n\n{lit_md}\n",
-            file_name="文献清单.md",
-            mime="text/markdown",
-        )
-    else:
-        st.info("暂无文献数据。")
-
-with tab3:
-    st.subheader("当前文献集的 33 项热点映射分类")
-    if not all_docs.empty:
-        texts = all_docs["Title"].fillna("").astype(str) + " " + all_docs["Abstract"].fillna("").astype(str)
-        topics_list = []
-        for text in texts:
-            topics_list.extend(extract_clinical_topics(text))
-
-        if topics_list:
-            df_counts = pd.DataFrame(Counter(topics_list).most_common(), columns=["热点主题", "匹配频次"])
-            fig = px.bar(
-                df_counts, x="匹配频次", y="热点主题", orientation="h",
-                color="匹配频次", color_continuous_scale="Reds",
-            )
-            fig.update_layout(
-                yaxis=dict(autorange="reversed"),
-                height=max(400, len(df_counts) * 25),
-            )
-            st.plotly_chart(fig, **STRETCH)
-        else:
-            st.info("未发现匹配的预设热点。")
-
-        st.markdown("---")
-        st.subheader("💊 当前文献集中讨论最热门的药物（自动提取）")
-        st.caption(
-            "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
-            "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
-        )
-        hot_df = extract_hot_drugs(all_docs, top_n=15)
-        if not hot_df.empty:
-            fig2 = px.bar(
-                hot_df, x="涉及文献数", y="药物", orientation="h",
-                color="涉及文献数", color_continuous_scale="Blues",
-            )
-            fig2.update_layout(
-                yaxis=dict(autorange="reversed"),
-                height=max(350, len(hot_df) * 30),
-            )
-            st.plotly_chart(fig2, **STRETCH)
-            st.dataframe(hot_df, hide_index=True, **STRETCH)
-        else:
-            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
-    else:
-        st.info("暂无文献数据。")
+review_topic = ss
