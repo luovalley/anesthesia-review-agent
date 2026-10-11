@@ -25,10 +25,10 @@ st.set_page_config(
 # ==========================================
 try:
     for _k, _v in st.secrets.items():
-        if isinstance(_v, (str, int, float)):  # 跳过嵌套表
+        if isinstance(_v, (str, int, float)):
             os.environ.setdefault(_k, str(_v))
 except Exception:
-    pass  # 本地没有 secrets.toml 时会抛异常，直接跳过
+    pass
 
 try:
     from dotenv import load_dotenv
@@ -47,7 +47,6 @@ NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
 ENV_TAVILY_KEY = normalize_key(os.getenv("TAVILY_API_KEY", ""))
 ENV_OPENROUTER_KEY = normalize_key(os.getenv("OPENROUTER_API_KEY", ""))
 
-# 邮箱改为从环境变量读取
 Entrez.email = NCBI_EMAIL or None
 Entrez.api_key = NCBI_API_KEY or None
 
@@ -626,7 +625,7 @@ def strip_citation_marks(text):
         "相关研究",
         text,
     )
-    text = re.sub(r"[ \t]+([，。；：、,.;:）)])", r"\1", text)
+    text = re.sub(r"[ \t]+([[,。；：、,.;:）)])", r"\1", text)
     text = re.sub(r"[（(]\s*[）)]", "", text)
     return text
 
@@ -656,7 +655,18 @@ def call_with_continuation(client, primary_model, messages, temperature=0.3):
     return strip_citation_marks(text), used_model, finish
 
 
-def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df, glossary_text=""):
+# 后台自动加载同目录下的 glossary.md 文件内容
+def load_glossary_content():
+    if os.path.exists("glossary.md"):
+        try:
+            with open("glossary.md", "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            pass
+    return ""
+
+
+def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df):
     try:
         clean_key = str(api_key).strip()
         if not clean_key:
@@ -695,13 +705,13 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
                 combined_input += f"- {r['药物']}：{r['涉及文献数']} 篇文献（占 {r['占比']}）\n"
         start, today = get_past_5_years_range()
 
-        # Glossary 规范拼接（方案 B 列表形式）
+        glossary_text = load_glossary_content()
         glossary_section = ""
         if glossary_text.strip():
             glossary_section = f"""
 ---
 ### 📖 专业术语表 (Glossary) 严格对齐规范：
-请在撰写、总结或翻译专业名词时，**必须严格参照**以下由用户提供的专有名词对照表（Glossary）。凡是表中出现的术语，其中文或英文译名必须与之一致，严禁出现与表不符的翻译：
+请在撰写、总结或翻译专业名词时，**必须严格参照**以下专有名词对照表（Glossary）[cite: 2]。凡是表中出现的术语，其中文或英文译名必须与之一致，严禁出现与表不符的翻译：
 {glossary_text.strip()}
 """
 
@@ -779,15 +789,16 @@ ASK_MODE = "💬 提问讨论（不改动文章）"
 
 
 def follow_up_review(api_key, model_name, base_messages, current_article,
-                     qa_history, user_text, mode, glossary_text=""):
+                     qa_history, user_text, mode):
     clean_key = str(api_key).strip()
     if not clean_key:
         raise RuntimeError("请填入有效的 OpenRouter API Key！")
     client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
 
+    glossary_text = load_glossary_content()
     glossary_directive = ""
     if glossary_text.strip():
-        glossary_directive = f"\n请继续严格参照以下专业术语表 (Glossary)：\n{glossary_text.strip()}\n"
+        glossary_directive = f"\n请继续严格参照以下专业术语表 (Glossary)[cite: 2]：\n{glossary_text.strip()}\n"
 
     if mode == REVISE_MODE:
         directive = (
@@ -841,30 +852,6 @@ st.markdown(
 
 st.sidebar.header("🔍 模式设置与 Key 配置")
 work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2])
-
-st.sidebar.markdown("---")
-st.sidebar.header("📖 专业术语表 (Glossary)")
-
-# 自动尝试加载同目录下的 glossary.md 文件
-default_glossary_content = ""
-if os.path.exists("glossary.md"):
-    try:
-        with open("glossary.md", "r", encoding="utf-8") as f:
-            default_glossary_content = f.read()
-    except Exception:
-        pass
-
-glossary_input = st.sidebar.text_area(
-    "输入或修改自定义 Glossary（支持列表/键值对）：",
-    value=default_glossary_content,
-    height=150,
-    placeholder=(
-        "例如：\n"
-        "- Intraoperative Hypotension: 术中低血压\n"
-        "- Sugammadex: 舒更葡糖钠"
-    ),
-    help="已自动从仓库中的 glossary.md 加载，你也可以在这里直接修改或补充[cite: 2]。",
-)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ 检索参数设置")
@@ -1022,7 +1009,7 @@ with tab1:
         else:
             with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
                 display_text, raw_text, base_msgs = generate_5000_words_review(
-                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df, glossary_input
+                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df
                 )
             if raw_text is None:
                 st.error(display_text)
@@ -1084,7 +1071,7 @@ with tab1:
                     with st.spinner(spinner_txt):
                         reply, used_model, finish = follow_up_review(
                             openrouter_api_key, openrouter_model, ss["base_messages"],
-                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode, glossary_input,
+                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode,
                         )
                     if mode == REVISE_MODE:
                         n = len(ss["versions"]) + 1
