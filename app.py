@@ -21,7 +21,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# 1. 凭证加载（Streamlit Secrets -> 环境变量 -> .env）
+# 1. 凭证加载（Streamlit Secrets -> 环境变量）
 # ==========================================
 try:
     for _k, _v in st.secrets.items():
@@ -672,25 +672,23 @@ def strip_citation_marks(text):
     if not text:
         return text
     pats = [
-        # 匹配各种带“来源”、“文献”、“Refs”等字眼的括号编号标记
-        r"[【\[（(]?\s*(?:来源\vert{}文献\vert{}Refs?\.?\vert{}References?\vert{}Sources?)\s*\d+(?:\s*[-–—~,，、;；和与及]\s*\d+)*\s*[等等等等etc\.]*\s*[）)\]】]?",
-        # 匹配纯数字序号括号，如 (来源2、3、4、7、8、10等)、[1, 2, 3] 等
-        r"[【\[（(]\s*(?:来源\s*)?\d+(?:\s*[-–—~,，、;；和与及]\s*\d+)*\s*等?\s*[）)\]】]",
-        r"[\[［【]\s*\d+(?:\s*[-–—~,，、;；]\s*\d+)*\s*[\]］】]",
-        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,，;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
+        r"[【\[（(]?\s*(?:来源\b\vert{}文献\b\vert{}Refs?\.?\b\vert{}References?\b\vert{}Sources?)\s*\d+(?:\s*[-–—~,.,、;；和与及]\s*\d+)*\s*[等等等等etc\.]*\s*[）)\]】]?",
+        r"[【\[（(]\s*(?:来源\s*)?\d+(?:\s*[-–—~,.,、;；和与及]\s*\d+)*\s*等?\s*[）)\]】]",
+        r"[\[［【]\s*\d+(?:\s*[-–—~,.,、;；]\s*\d+)*\s*[\]］】]",
+        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,.,;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
         r"[（(]\s*https?://[^\s)）]+\s*[）)]",
         r",?\s*PMID\s*[:：]?\s*\d{5,9}",
         r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+",
-        r"\^\s*\[?\d+(?:\s*[,，-]\s*\d+)*\]?",
+        r"\^\s*\[?\d+(?:\s*[,.,-]\s*\d+)*\]?",
     ]
     for p in pats:
         text = re.sub(p, "", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"(?:本地文献|全网/PubMed\s*文献|全网文献|PubMed\s*文献)\s*\d+(?:\s*[-–—~,，、和与及]\s*\d+)*",
+        r"(?:本地文献|全网/PubMed\s*文献|全网文献|PubMed\s*文献)\s*\d+(?:\s*[-–—~,.,、和与及]\s*\d+)*",
         "相关研究",
         text,
     )
-    text = re.sub(r"[ \t]+([,[,，。；：、;；）)])", r"\1", text)
+    text = re.sub(r"[ \t]+([,[,.,。；：、;；）)])", r"\1", text)
     text = re.sub(r"[（(]\s*[）)]", "", text)
     return text
 
@@ -764,12 +762,12 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
                 glossary_section = f"""
 ---
 ### 📖 专业术语表 (Glossary) 严格对齐规范：
-请在撰写, 总结或翻译专业名词时, **必须严格参照**以下专有名词对照表（Glossary）:
+请在撰写、总结或翻译专业名词时，**必须严格参照**以下专有名词对照表（Glossary）:
 {glossary_text.strip()}
 """
 
         prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
-请基于我提供的【用户上传文献】以及【全网学术检索与 PubMed 数据库近 5 年检索到的文献】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
+请基于我提供的【用户上传文献】以及【全网学术搜索与 PubMed 数据库近 5 年检索到的文献】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
 
 背景资料如下：
 {combined_input}
@@ -806,14 +804,14 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 ### ⚠️ 输出格式极其严格的约束（切记）：
 1. 必须完整输出完所有的 7 个章节，**特别是“六、临床转化表格”和“七、总结与展望”必须完整撰写完，绝对不能中途截断**！
 2. 请使用标准 Markdown 格式，语言专业严谨。
-3. **绝对禁止在正文中出现任何形式的文献序号、标号或标记**：包括但不限于 `[1]`、`[1,2]`、`(来源2、3等)`、上标数字、或者任何形式的“文献1”、“本地文献”、“全网文献”、“PMID”等引用标识。正文表述文献时，必须完全采用无序号的自然语言学术叙述（例如：“多项临床研究显示……”、“近期关于衰弱评估的试验表明……”）。
-4. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID；资料不足之处请明确说明“现有资料未覆盖”。
+3. **绝对禁止在正文中出现任何形式的文献序号、标号或标记**：包括但不限于 `[1]`、`[1,2]`、`(来源2、3等)`、上标数字、或者任何形式的“文献1”、“本地文献”、“全网文献”、“PMID”等引用标识。正文表述文献时，必须完全采用无序号的自然语言学术叙述。
+4. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID；资料不足之处请明确说明。
 """
 
         messages = [
             {
                 "role": "system",
-                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号（如 [1]、(来源2、3等)）。",
+                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号。",
             },
             {"role": "user", "content": prompt},
         ]
@@ -912,24 +910,22 @@ work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2], 
 
 st.sidebar.markdown("---")
 
-st.sidebar.header("🔑 API Key 设置")
+st.sidebar.header("🔑 API 凭证配置（自动加载）")
 _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
 
 openrouter_input = st.sidebar.text_input(
-    "API Key (OpenRouter / DeepSeek)",
-    value="", type="password", **_AC,
-    placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
+    "OpenRouter API Key",
+    value=ENV_OPENROUTER_KEY, type="password", **_AC,
+    placeholder="已自动从 Secrets 加载" if ENV_OPENROUTER_KEY else "请输入",
 )
-_typed_or = normalize_key(openrouter_input)
-openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
+openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
 
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
-    value="", type="password", **_AC,
-    placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
+    value=ENV_TAVILY_KEY, type="password", **_AC,
+    placeholder="已自动从 Secrets 加载" if ENV_TAVILY_KEY else "请输入",
 )
-_typed_tavily = normalize_key(tavily_input)
-tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
+tavily_api_key = normalize_key(tavily_input) or ENV_TAVILY_KEY
 
 MODEL_CUSTOM = "✏️ 自定义模型 ID…"
 live_models = fetch_openrouter_models()
@@ -951,7 +947,7 @@ else:
 options = ordered + [MODEL_CUSTOM]
 default_idx = options.index(DEFAULT_OPENROUTER_MODEL) if DEFAULT_OPENROUTER_MODEL in options else 0
 choice = st.sidebar.selectbox(
-    "选择翻译大模型",
+    "选择大模型",
     options=options,
     index=default_idx,
     format_func=lambda x: x if x == MODEL_CUSTOM else labels.get(x, x),
@@ -968,7 +964,7 @@ st.sidebar.markdown("---")
 enable_glossary_checkbox = st.sidebar.checkbox("启用麻醉学专业术语动态对齐", value=True)
 
 max_doc_count = st.sidebar.slider(
-    "单次文本分块字符数 / 检索文献数量",
+    "检索文献数量限制",
     min_value=10, max_value=100, value=50, step=10,
 )
 
