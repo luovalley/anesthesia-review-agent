@@ -915,11 +915,13 @@ _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_inp
 
 openrouter_input = st.sidebar.text_input(
     "OpenRouter API Key",
-    value=ENV_OPENROUTER_KEY, type="password", **_AC,
-    placeholder="已自动从 Secrets 加载" if ENV_OPENROUTER_KEY else "请输入",
+    value="",
+    type="password",
+    **_AC,
+    placeholder=(
+        "留空则使用后台默认配置" if ENV_OPENROUTER_KEY else "请输入 Key"
+    ),
 )
-openrouter_api_key = normalize_key(openrouter_input) or ENV_OPENROUTER_KEY
-
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
     value=ENV_TAVILY_KEY, type="password", **_AC,
