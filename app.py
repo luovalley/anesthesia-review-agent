@@ -913,21 +913,29 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔑 API 凭证配置（自动加载）")
 _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
 
+# 修改 OpenRouter 输入框，加上 key="or_key_input"
 openrouter_input = st.sidebar.text_input(
-    "OpenRouter API Key",
-    value="",
-    type="password",
+    "API Key (OpenRouter / DeepSeek)",
+    value="", 
+    type="password", 
+    key="or_key_input",  # <--- 加上这一行，打破 Streamlit 状态缓存
     **_AC,
-    placeholder=(
-        "留空则使用后台默认配置" if ENV_OPENROUTER_KEY else "请输入 Key"
-    ),
+    placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
 )
+_typed_or = normalize_key(openrouter_input)
+openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
+
+# 修改 Tavily 输入框，加上 key="tavily_key_input"
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
-    value=ENV_TAVILY_KEY, type="password", **_AC,
-    placeholder="已自动从 Secrets 加载" if ENV_TAVILY_KEY else "请输入",
+    value="", 
+    type="password", 
+    key="tavily_key_input",  # <--- 加上这一行
+    **_AC,
+    placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
 )
-tavily_api_key = normalize_key(tavily_input) or ENV_TAVILY_KEY
+_typed_tavily = normalize_key(tavily_input)
+tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
 
 MODEL_CUSTOM = "✏️ 自定义模型 ID…"
 live_models = fetch_openrouter_models()
