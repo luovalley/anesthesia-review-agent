@@ -542,6 +542,8 @@
 * Desmopressin — 去氨加压素 (DDAVP)
 
 * Dextran — 右旋糖酐
+  
+* Dexmedetomidine — 右美托咪啶
 
 * Dextrose — 葡萄糖
 
@@ -2831,7 +2833,7 @@
 
 * Rectal Anesthesia — 经直肠麻醉
 
-* Rectum — 直肠
+* Remimazolam — 瑞马唑仑
 
 * Red Blood Cell — 红细胞
 
