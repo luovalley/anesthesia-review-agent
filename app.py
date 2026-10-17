@@ -90,7 +90,9 @@ def load_glossary_content():
     if os.path.exists("glossary.md"):
         try:
             with open("glossary.md", "r", encoding="utf-8") as f:
-                return f.read()
+                content = f.read()
+                # 可以在这里对词典做一些预处理或直接返回
+                return content
         except Exception:
             pass
     return ""
@@ -897,9 +899,13 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             if glossary_text.strip():
                 glossary_section = f"""
 ---
-### 📖 专业术语表 (Glossary) 严格对齐规范：
-请在撰写、总结或翻译专业名词时，**必须严格参照**以下专有名词对照表（Glossary）:
+### 📖 专业术语表 (Glossary) 严格对齐与翻译规范：
+请在撰写综述时**必须严格参照**以下专有名词对照表：
 {glossary_text.strip()}
+
+**⚠️ 核心硬性要求**：
+1. **大小写不敏感匹配**：无论背景资料中的英文专业名词是大写（如 Hypotension）、小写（如 hypotension）还是复数形式，**在中文正文中都必须严格翻译并替换为词典中对应的中文专业译名**。
+2. 绝对不允许在中文正文里直接大段保留未翻译的英文核心病名、药名或生理指标（如不得直接出现 "hypotension"，必须译为“低血压”）。
 """
 
         prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
