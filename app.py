@@ -6,6 +6,8 @@ import os
 import re
 import time
 from collections import Counter
+import base64
+import requests
 
 import pandas as pd
 import plotly.express as px
@@ -295,7 +297,7 @@ CLINICAL_TOPICS = {
 
 
 # ==========================================
-# 3. 辅助计算与文本处理逻辑
+# 3. 辅助计算、文本处理与 GitHub 词典同步逻辑
 # ==========================================
 def extract_clinical_topics(text):
     text_lower = str(text).lower()
@@ -350,7 +352,6 @@ def get_past_5_years_date_filter():
 def doc_link(identifier):
     ident = str(identifier or "").strip()
     if "PMID:" in ident:
-        # 兼容处理可能带有 PMC 的显示
         pmid_part = [x for x in ident.split("|") if "PMID:" in x]
         if pmid_part:
             pmid = pmid_part[0].replace("PMID:", "").strip()
@@ -469,6 +470,58 @@ def parse_uploaded_files(uploaded_files):
     return pd.DataFrame(data, columns=DOC_COLUMNS)
 
 
+def append_term_to_glossary(term_pair_text):
+    """通过 GitHub API 自动将专业术语追加到 GitHub 仓库的 glossary.md 中"""
+    clean_text = term_pair_text.strip()
+    if not clean_text:
+        return False, "内容为空"
+    
+    if not clean_text.startswith(("-", "*")):
+        clean_text = f"- {clean_text}"
+
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    repo = os.getenv("GITHUB_REPO", "").strip()  # 格式: "username/repo"
+    branch = os.getenv("GITHUB_BRANCH", "main").strip()
+
+    if not token or not repo:
+        return False, "未配置 GITHUB_TOKEN 或 GITHUB_REPO 环境变量/Secret"
+
+    url = f"https://api.github.com/repos/{repo}/contents/glossary.md"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return False, f"读取远端 glossary.md 失败: {resp.text}"
+        
+        data = resp.json()
+        sha = data.get("sha")
+        current_encoded_content = data.get("content", "")
+        
+        current_bytes = base64.b64decode(current_encoded_content)
+        current_text = current_bytes.decode("utf-8", errors="ignore")
+
+        new_text = current_text.rstrip() + f"\n{clean_text}\n"
+        new_encoded_content = base64.b64encode(new_text.encode("utf-8")).decode("utf-8")
+
+        payload = {
+            "message": f"Auto-update glossary.md via Streamlit app: {clean_text[:30]}",
+            "content": new_encoded_content,
+            "sha": sha,
+            "branch": branch
+        }
+        put_resp = requests.put(url, headers=headers, json=payload, timeout=15)
+        if put_resp.status_code in (200, 201):
+            return True, "成功写入并同步至 GitHub 仓库！"
+        else:
+            return False, f"写入 GitHub 失败: {put_resp.text}"
+    except Exception as e:
+        return False, f"请求异常: {e}"
+
+
 # ==========================================
 # 4. 检索引擎：Tavily 全网 + PubMed（支持 PMC 开放全文）
 # ==========================================
@@ -543,11 +596,9 @@ def search_pubmed(query, max_results):
             art = medline["Article"]
             pmid = str(medline["PMID"])
             
-            # 提取标准摘要
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
             abstract_text = " ".join(str(x) for x in abs_list)
             
-            # 检查是否有 PMCID，用于获取 PMC 免费全文
             pmcid = ""
             pubmed_data = article.get("PubmedData", {})
             for id_elem in pubmed_data.get("ArticleIdList", []):
@@ -558,7 +609,6 @@ def search_pubmed(query, max_results):
             full_text = abstract_text
             source_desc = "PubMed (数据库摘要)"
 
-            # 如果存在 PMCID，尝试抓取 PMC 开放获取的全文
             if pmcid:
                 try:
                     pmc_handle = Entrez.efetch(db="pmc", id=pmcid.replace("PMC", ""), retmode="xml")
@@ -566,7 +616,7 @@ def search_pubmed(query, max_results):
                     pmc_handle.close()
                     clean_pmc_text = re.sub(r'<[^>]+>', ' ', pmc_data)
                     if len(clean_pmc_text) > len(abstract_text):
-                        full_text = clean_pmc_text[:6000] # 截取更全面的正文细节
+                        full_text = clean_pmc_text[:6000]
                         source_desc = "PubMed Central (PMC 开放全文)"
                 except Exception:
                     pass
@@ -577,7 +627,7 @@ def search_pubmed(query, max_results):
             rows.append({
                 "PMID/URL": f"PMID:{pmid}" + (f" | {pmcid}" if pmcid else ""),
                 "Title": str(art.get("ArticleTitle", "")),
-                "Abstract": full_text,  # 升级后的长文本/全文内容
+                "Abstract": full_text,
                 "Year": year,
                 "Source": source_desc,
             })
@@ -593,8 +643,6 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
         msgs.append(("info", "主题中没有可用的英文关键词，已退回使用通用关键词 `Anesthesia` 检索；建议改用英文主题。"))
 
     frames = []
-    
-    # 🔵 完整保留 Tavily 全网学术搜索模块
     if tavily_key:
         try:
             df = search_tavily(query, tavily_key, max_results)
@@ -606,7 +654,6 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
     else:
         msgs.append(("warning", "Tavily API Key 为空，已跳过全网搜索。"))
 
-    # 🟢 检索 PubMed 数据库（含 PMC 全文拓展）
     try:
         frames.append(search_pubmed(query, max_results))
     except Exception as e:
@@ -824,10 +871,10 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 * 梳理该领域（【{topic_keywords}】）近 5 年（{start.year}-{today.year}年）的发展轨迹。
 
 #### 三、 近五年核心学术突破与重大研究进展 (Major Breakthroughs)
-* 结合文献中的**具体实验设计、样本量、干预手段与量化结果数据**，深入阐述突破性研究成果（分子机制、临床试验 RCTs、新型药物或技术应用），避免泛泛而谈。
+* 请结合上述文献的**具体实验设计、样本量、干预手段与量化结果数据**，深入阐述突破性研究成果（分子机制、临床试验 RCTs、新型药物或技术应用），避免泛泛而谈。
 
 #### 四、 当前热点领域的核心争论与未解决的临床困境 (Key Controversies)
-* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点（疗效争议、安全隐患、矛盾结论等，引用资料中的数据冲突）。
+* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点。请直接引用不同研究在具体终点指标、不良反应或人群亚组上的数据冲突。
 
 #### 五、 机制探讨与方法学瓶颈 (Mechanistic Insights)
 * 讨论当前基础与临床研究面临的方法学瓶颈。
@@ -1163,8 +1210,12 @@ with tab1:
             mode = st.radio("本次操作：", [REVISE_MODE, ASK_MODE], horizontal=True)
             user_text = st.text_area(
                 "请输入内容：", height=120,
-                placeholder="修改示例：把第四章的争论部分扩写，并增加关于老年患者的讨论；"
-                            "提问示例：第六章表格中的肌松监测建议依据是什么？",
+                placeholder="修改示例：把第四章的争论部分扩写，并增加关于老年患者的讨论；\n"
+                            "提问/纠错示例：Remimazolam 应该翻译为“瑞马唑仑”。",
+            )
+            save_to_github_glossary = st.checkbox(
+                "📌 自动将此纠错/术语同步写入 GitHub 的 glossary.md 词典", 
+                value=False
             )
             submitted = st.form_submit_button("提交", type="primary")
 
@@ -1181,6 +1232,14 @@ with tab1:
                             openrouter_api_key, openrouter_model, ss["base_messages"],
                             ss["current_raw"], ss["qa_history"], user_text.strip(), mode, enable_glossary_checkbox,
                         )
+                    
+                    if save_to_github_glossary:
+                        success, msg = append_term_to_glossary(user_text.strip())
+                        if success:
+                            st.success(f"✅ {msg}")
+                        else:
+                            st.error(f"❌ 词典同步失败: {msg}")
+
                     if mode == REVISE_MODE:
                         n = len(ss["versions"]) + 1
                         short = re.sub(r"\s+", " ", user_text.strip())[:12]
