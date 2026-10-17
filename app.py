@@ -565,6 +565,14 @@ def search_tavily(query, api_key, max_results):
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
 
 
+def _pubmed_esearch(term, retmax):
+    handle = Entrez.esearch(db="pubmed", term=term, retmax=retmax, sort="relevance")
+    try:
+        return Entrez.read(handle).get("IdList", [])
+    finally:
+        handle.close()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_pubmed(query, max_results):
     date_filter = get_past_5_years_date_filter()
@@ -629,7 +637,6 @@ def search_pubmed(query, max_results):
                 "Source": source_desc,
             })
         except Exception:
-            # 单篇文献解析失败时跳过，绝不影响其他文献的收录
             continue
             
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
