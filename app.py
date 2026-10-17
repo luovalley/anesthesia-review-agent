@@ -596,11 +596,11 @@ def search_pubmed(query, max_results):
             art = medline["Article"]
             pmid = str(medline["PMID"])
             
-            # 1. 提取标准摘要
+            # 1. 提取标准摘要作为保底
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
             abstract_text = " ".join(str(x) for x in abs_list)
             
-            # 2. 安全提取 PMCID（用于获取开放获取全文）
+            # 2. 提取 PMCID
             pmcid = ""
             pubmed_data = article.get("PubmedData", {})
             for id_elem in pubmed_data.get("ArticleIdList", []):
@@ -611,20 +611,35 @@ def search_pubmed(query, max_results):
             full_text = abstract_text
             source_desc = "PubMed (数据库摘要)"
 
-            # 3. 尝试抓取 PMC 开放全文
+            # 3. 增强版 PMC 全文抓取
             if pmcid:
+                pmc_num = pmcid.replace("PMC", "").strip()
                 try:
-                    pmc_id_num = pmcid.replace("PMC", "")
-                    pmc_handle = Entrez.efetch(db="pmc", id=pmc_id_num, retmode="xml")
+                    # 尝试方法 A：通过 NCBI efetch 获取 PMC XML 并提取正文
+                    pmc_handle = Entrez.efetch(db="pmc", id=pmc_num, retmode="xml")
                     pmc_data = pmc_handle.read()
                     pmc_handle.close()
                     
-                    clean_pmc_text = re.sub(r'<[^>]+>', ' ', pmc_data)
-                    if len(clean_pmc_text) > len(abstract_text):
-                        full_text = clean_pmc_text[:8000] # 获取详细正文
+                    # 过滤 XML 标签，提取正文内容
+                    clean_text = re.sub(r'<[^>]+>', ' ', pmc_data)
+                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                    
+                    if len(clean_text) > len(abstract_text) + 200:
+                        full_text = clean_text[:8000]  # 截取前 8000 字符的详细正文
                         source_desc = "PubMed Central (PMC 开放全文)"
                 except Exception:
-                    pass
+                    try:
+                        # 尝试方法 B：通过 NCBI E-utilities 的 efetch text 模式或者公共网页接口兜底
+                        import urllib.request
+                        url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmc_num}&retmode=text"
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=10) as response:
+                            web_content = response.read().decode('utf-8', errors='ignore')
+                            if len(web_content) > len(abstract_text) + 200:
+                                full_text = web_content[:8000]
+                                source_desc = "PubMed Central (PMC 开放全文)"
+                    except Exception:
+                        pass
 
             pub_date = art.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
             year = str(pub_date.get("Year") or str(pub_date.get("MedlineDate", "N/A"))[:4])
