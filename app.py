@@ -668,17 +668,44 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
 # 5. AI 综述生成引擎与云端自动存储
 # ==========================================
 def save_review_to_cloud(topic, content, tag="V1"):
-    os.makedirs("saved_reviews", exist_ok=True)
+    """优先尝试通过 GitHub API 保存到远端仓库的 reviews/ 文件夹中，失败则降级保存到本地临时目录"""
     safe_name = re.sub(r'[\\/:*?"<>|]', "_", topic)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"saved_reviews/{safe_name}_{tag}_{timestamp}.md"
+    file_path_in_repo = f"reviews/{safe_name}_{tag}_{timestamp}.md"
+    
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    repo = os.getenv("GITHUB_REPO", "").strip()
+    branch = os.getenv("GITHUB_BRANCH", "main").strip()
+
+    # 如果配置了 GitHub API 凭证，直接通过 API 提交并保存在 GitHub 仓库中
+    if token and repo:
+        url = f"https://api.github.com/repos/{repo}/contents/{file_path_in_repo}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        try:
+            encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+            payload = {
+                "message": f"Auto-save review: {safe_name} ({tag})",
+                "content": encoded_content,
+                "branch": branch
+            }
+            put_resp = requests.put(url, headers=headers, json=payload, timeout=15)
+            if put_resp.status_code in (200, 201):
+                return file_path_in_repo
+        except Exception:
+            pass
+
+    # 降级方案：若未配置 GitHub 凭证，则保存在本地临时目录（服务器重启后会丢失）
+    os.makedirs("saved_reviews", exist_ok=True)
+    local_filename = f"saved_reviews/{safe_name}_{tag}_{timestamp}.md"
     try:
-        with open(filename, "w", encoding="utf-8") as f:
+        with open(local_filename, "w", encoding="utf-8") as f:
             f.write(content)
-        return filename
+        return local_filename
     except Exception:
         return None
-
 
 def call_openrouter_with_fallback(client, primary_model, messages, temperature=0.3):
     models_to_try = [primary_model] + [m for m in FALLBACK_FREE_MODELS if m != primary_model]
