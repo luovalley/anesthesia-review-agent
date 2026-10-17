@@ -349,6 +349,12 @@ def get_past_5_years_date_filter():
 
 def doc_link(identifier):
     ident = str(identifier or "").strip()
+    if "PMID:" in ident:
+        # 兼容处理可能带有 PMC 的显示
+        pmid_part = [x for x in ident.split("|") if "PMID:" in x]
+        if pmid_part:
+            pmid = pmid_part[0].replace("PMID:", "").strip()
+            return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", ident
     if ident.upper().startswith("PMID:"):
         pmid = ident.split(":", 1)[1].strip()
         return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", f"PMID:{pmid}"
@@ -356,7 +362,7 @@ def doc_link(identifier):
         return ident, ident
     if ident.isdigit():
         return f"https://pubmed.ncbi.nlm.nih.gov/{ident}/", f"PMID:{ident}"
-    return None, "本地上传文件（无在线链接）"
+    return None, ident or "本地上传文件（无在线链接）"
 
 
 def _md_escape(text):
@@ -370,9 +376,10 @@ def build_literature_markdown(df):
         url, shown = doc_link(row.get("PMID/URL"))
         title = _md_escape(row.get("Title"))
         year = str(row.get("Year") or "N/A")
+        source = str(row.get("Source") or "未知来源")
         head = f"[{title}]({url})" if url else title
         link_part = f"[{shown}]({url})" if url else shown
-        lines.append(f"{i}. **{head}**  \n   年份：{year} ｜ 链接：{link_part}")
+        lines.append(f"{i}. **{head}**  \n   年份：{year} ｜ 来源：{source} ｜ 链接：{link_part}")
     return "\n\n".join(lines)
 
 
@@ -424,14 +431,14 @@ def parse_uploaded_files(uploaded_files):
                 import pypdf
 
                 reader = pypdf.PdfReader(io.BytesIO(raw))
-                abstract = "".join(p.extract_text() or "" for p in reader.pages)[:4000]
+                abstract = "".join(p.extract_text() or "" for p in reader.pages)[:6000]
             elif ext == "docx":
                 import docx
 
                 doc = docx.Document(io.BytesIO(raw))
-                abstract = "\n".join(p.text for p in doc.paragraphs)[:4000]
+                abstract = "\n".join(p.text for p in doc.paragraphs)[:6000]
             elif ext == "txt":
-                abstract = _decode_bytes(raw)[:4000]
+                abstract = _decode_bytes(raw)[:6000]
             elif ext == "csv":
                 df_up = pd.read_csv(io.StringIO(_decode_bytes(raw)))
                 for i, (_, row) in enumerate(df_up.iterrows(), 1):
@@ -463,7 +470,7 @@ def parse_uploaded_files(uploaded_files):
 
 
 # ==========================================
-# 4. 检索引擎：Tavily 全网 + PubMed
+# 4. 检索引擎：Tavily 全网 + PubMed（支持 PMC 开放全文）
 # ==========================================
 def tavily_request(api_key, query, max_results):
     import requests
@@ -534,15 +541,45 @@ def search_pubmed(query, max_results):
         try:
             medline = article["MedlineCitation"]
             art = medline["Article"]
+            pmid = str(medline["PMID"])
+            
+            # 提取标准摘要
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
+            abstract_text = " ".join(str(x) for x in abs_list)
+            
+            # 检查是否有 PMCID，用于获取 PMC 免费全文
+            pmcid = ""
+            pubmed_data = article.get("PubmedData", {})
+            for id_elem in pubmed_data.get("ArticleIdList", []):
+                if id_elem.attributes.get("IdType") == "pmc":
+                    pmcid = str(id_elem)
+                    break
+
+            full_text = abstract_text
+            source_desc = "PubMed (数据库摘要)"
+
+            # 如果存在 PMCID，尝试抓取 PMC 开放获取的全文
+            if pmcid:
+                try:
+                    pmc_handle = Entrez.efetch(db="pmc", id=pmcid.replace("PMC", ""), retmode="xml")
+                    pmc_data = pmc_handle.read()
+                    pmc_handle.close()
+                    clean_pmc_text = re.sub(r'<[^>]+>', ' ', pmc_data)
+                    if len(clean_pmc_text) > len(abstract_text):
+                        full_text = clean_pmc_text[:6000] # 截取更全面的正文细节
+                        source_desc = "PubMed Central (PMC 开放全文)"
+                except Exception:
+                    pass
+
             pub_date = art.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
             year = str(pub_date.get("Year") or str(pub_date.get("MedlineDate", "N/A"))[:4])
+            
             rows.append({
-                "PMID/URL": f"PMID:{medline['PMID']}",
+                "PMID/URL": f"PMID:{pmid}" + (f" | {pmcid}" if pmcid else ""),
                 "Title": str(art.get("ArticleTitle", "")),
-                "Abstract": " ".join(str(x) for x in abs_list),
+                "Abstract": full_text,  # 升级后的长文本/全文内容
                 "Year": year,
-                "Source": "PubMed (数据库)",
+                "Source": source_desc,
             })
         except Exception:
             continue
@@ -556,6 +593,8 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
         msgs.append(("info", "主题中没有可用的英文关键词，已退回使用通用关键词 `Anesthesia` 检索；建议改用英文主题。"))
 
     frames = []
+    
+    # 🔵 完整保留 Tavily 全网学术搜索模块
     if tavily_key:
         try:
             df = search_tavily(query, tavily_key, max_results)
@@ -567,6 +606,7 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
     else:
         msgs.append(("warning", "Tavily API Key 为空，已跳过全网搜索。"))
 
+    # 🟢 检索 PubMed 数据库（含 PMC 全文拓展）
     try:
         frames.append(search_pubmed(query, max_results))
     except Exception as e:
@@ -732,16 +772,17 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             for i, (_, row) in enumerate(local_df.head(20).iterrows(), 1):
                 local_text += (
                     f"文献标题: {row.get('Title', '')}\n"
-                    f"摘要/内容: {str(row.get('Abstract', ''))[:800]}...\n\n"
+                    f"内容/正文细节: {str(row.get('Abstract', ''))[:3500]}...\n\n"
                 )
 
         web_text = ""
         if not web_df.empty:
-            web_text += "\n=== [全网及PubMed文献资料] ===\n"
-            for i, (_, row) in enumerate(web_df.head(30).iterrows(), 1):
+            web_text += "\n=== [全网学术搜索(Tavily)与PubMed全文/摘要资料] ===\n"
+            for i, (_, row) in enumerate(web_df.head(25).iterrows(), 1):
                 web_text += (
                     f"文献标题: {row.get('Title', '')} ({row.get('Year', '')})\n"
-                    f"摘要: {str(row.get('Abstract', ''))[:500]}...\n\n"
+                    f"来源: {row.get('Source', '')}\n"
+                    f"核心内容与数据节选: {str(row.get('Abstract', ''))[:3500]}...\n\n"
                 )
 
         combined_input = local_text + web_text
@@ -767,7 +808,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 """
 
         prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
-请基于我提供的【用户上传文献】以及【全网学术搜索与 PubMed 数据库近 5 年检索到的文献】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
+请基于我提供的【用户上传文献】以及【全网学术搜索(Tavily)与 PubMed/PMC 全文数据库近 5 年检索到的文献】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
 
 背景资料如下：
 {combined_input}
@@ -783,10 +824,10 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 * 梳理该领域（【{topic_keywords}】）近 5 年（{start.year}-{today.year}年）的发展轨迹。
 
 #### 三、 近五年核心学术突破与重大研究进展 (Major Breakthroughs)
-* 分类阐述突破性研究成果（分子机制、临床试验 RCTs、新型药物或技术应用）。
+* 结合文献中的**具体实验设计、样本量、干预手段与量化结果数据**，深入阐述突破性研究成果（分子机制、临床试验 RCTs、新型药物或技术应用），避免泛泛而谈。
 
 #### 四、 当前热点领域的核心争论与未解决的临床困境 (Key Controversies)
-* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点（疗效争议、安全隐患、矛盾结论等）。
+* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点（疗效争议、安全隐患、矛盾结论等，引用资料中的数据冲突）。
 
 #### 五、 机制探讨与方法学瓶颈 (Mechanistic Insights)
 * 讨论当前基础与临床研究面临的方法学瓶颈。
@@ -831,7 +872,7 @@ def wrap_article(result, used_model, finish):
     if finish == "length":
         note = "\n\n> ⚠️ *输出经多次自动续写后仍未写完，可在下方提交“继续补全未完成章节”，或更换模型。*"
     return (
-        f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网文献生成，"
+        f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网与全文文献生成，"
         f"内容须经专业人员核实后方可使用*\n\n" + result + note
     )
 
@@ -857,7 +898,7 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
         directive = (
             f"请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
             f"(保持 7 个章节结构与 Markdown 表格，不得省略、缩写或中途截断；"
-            f"只能依据背景资料中的文献，严禁编造；**正文中严禁出现任何形式的参考文献序号、标号、(来源...) 或 PMID**；直接输出文章，不要额外解释)。"
+            f"只能依据背景资料中的文献，严禁编造；**正文中严禁出现任何形式的参考文献序号、标号、(来源...) 或 PMID**；直接输出文章，不要额外解释)."
             f"{glossary_directive}\n\n"
             f"修改意见：{user_text}"
         )
@@ -899,8 +940,8 @@ ss.setdefault("qa_history", [])
 
 st.title("💉 麻醉学全网文献热点追踪与深度综述生成系统")
 st.markdown(
-    "支持**上传本地文献** + **Tavily 全网学术搜索** + **PubMed 数据库**，"
-    "一键撰写包含**核心争论、临床建议表格与未来方向**的学术综述。"
+    "支持**上传本地文献** + **Tavily 全网学术搜索** + **PubMed / PMC 全文数据库**，"
+    "一键撰写包含**核心争论、临床建议表格与未来方向**的深度学术综述。"
 )
 
 render_auth_header()
@@ -913,24 +954,22 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔑 API 凭证配置（自动加载）")
 _AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
 
-# 修改 OpenRouter 输入框，加上 key="or_key_input"
 openrouter_input = st.sidebar.text_input(
     "API Key (OpenRouter / DeepSeek)",
     value="", 
     type="password", 
-    key="or_key_input",  # <--- 加上这一行，打破 Streamlit 状态缓存
+    key="or_key_input",
     **_AC,
     placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
 )
 _typed_or = normalize_key(openrouter_input)
 openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
 
-# 修改 Tavily 输入框，加上 key="tavily_key_input"
 tavily_input = st.sidebar.text_input(
     "Tavily 全网搜索 API Key",
     value="", 
     type="password", 
-    key="tavily_key_input",  # <--- 加上这一行
+    key="tavily_key_input",
     **_AC,
     placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
 )
@@ -1016,7 +1055,7 @@ else:
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🔍 开始检索文献", type="primary", disabled=not search_topic):
-    with st.spinner(f"正在全网（Tavily + PubMed）检索与【{search_topic}】相关的近 5 年文献..."):
+    with st.spinner(f"正在通过 Tavily 全网与 PubMed / PMC 全文检索【{search_topic}】近 5 年文献..."):
         ss["web_df"], ss["search_msgs"] = fetch_web_and_pubmed_literature(
             search_topic, tavily_api_key, max_doc_count
         )
@@ -1030,7 +1069,7 @@ review_topic = ss["searched_topic"] or search_topic
 st.markdown("### 📊 当前数据准备状态")
 c1, c2, c3 = st.columns(3)
 c1.metric("解析本地文献数", f"{len(local_df)} 篇")
-c2.metric("全网/PubMed 关联文献", f"{len(web_df)} 篇")
+c2.metric("全网/PubMed 全文关联文献", f"{len(web_df)} 篇")
 c3.metric("拟撰写综述主题", review_topic or "未指定")
 
 for level, text in ss["search_msgs"]:
@@ -1047,8 +1086,8 @@ tab1, tab2, tab3 = st.tabs(
 with tab1:
     st.subheader("📝 AI 深度撰写：知识更新综述")
     st.caption(
-        "系统将融合本地文献与全网学术搜索（Tavily）以及 PubMed 数据库近 5 年的研究，"
-        "探讨学术争论并输出临床转化表格。生成后会自动保存在服务器云端。"
+        "系统将融合本地文献、Tavily 全网搜索以及 PubMed/PMC 全文数据库近 5 年研究，"
+        "深度挖掘实验数据并输出临床转化表格。生成后会自动保存在服务器云端。"
     )
 
     if os.path.exists("saved_reviews"):
@@ -1076,7 +1115,7 @@ with tab1:
         elif local_df.empty and web_df.empty:
             st.warning("当前没有文献数据，请先点击“开始检索文献”或上传文件！")
         else:
-            with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
+            with st.spinner(f"AI 正在围绕【{review_topic}】结合全文深度撰写综述，可能需要 1-5 分钟，请稍候..."):
                 display_text, raw_text, base_msgs = generate_5000_words_review(
                     openrouter_api_key, openrouter_model, review_topic, local_df, web_df, enable_glossary_checkbox
                 )
@@ -1108,7 +1147,7 @@ with tab1:
         st.download_button(
             label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
             data=shown["text"],
-            file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
+            file_name=f"{safe_name}_全网与全文深度综述_{ver_tag}.md",
             mime="text/markdown",
         )
 
@@ -1162,13 +1201,13 @@ with tab1:
                     st.error(f"❌ 处理失败: {e}")
 
 with tab2:
-    st.subheader("已调用的文献数据明细")
+    st.subheader("已调用的文献及全文数据明细")
     if not all_docs.empty:
         lit_md = build_literature_markdown(all_docs)
         st.caption(f"共 {len(all_docs)} 篇（点击标题或链接可直接访问）")
         st.markdown(lit_md)
         st.download_button(
-            label="📥 下载文献清单 (.md)",
+            label="📥 下载文献与来源清单 (.md)",
             data=f"# 文献清单：{review_topic or '未指定主题'}\n\n{lit_md}\n",
             file_name="文献清单.md",
             mime="text/markdown",
@@ -1201,8 +1240,8 @@ with tab3:
         st.markdown("---")
         st.subheader("💊 当前文献集中讨论最热门的药物（自动提取）")
         st.caption(
-            "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
-            "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
+            "依据药物国际通用名（INN）词干规则，从标题与全文/摘要中自动识别药物，"
+            "统计被多少篇文献提及。"
         )
         hot_df = extract_hot_drugs(all_docs, top_n=15)
         if not hot_df.empty:
@@ -1217,6 +1256,6 @@ with tab3:
             st.plotly_chart(fig2, **STRETCH)
             st.dataframe(hot_df, hide_index=True, **STRETCH)
         else:
-            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
+            st.info("当前文献集中未识别到药物名称。")
     else:
         st.info("暂无文献数据。")
