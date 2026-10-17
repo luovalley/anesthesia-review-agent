@@ -3688,3 +3688,4 @@
 * Zygapophyseal Joint — 关节突关节
 - Ciprofol 环泊酚
 - Post-induction hypotension (PIH)= 麻醉诱导后低血压
+- 巴雷受体应该翻译成压力感受器
