@@ -3696,3 +3696,4 @@ Inferior Vena Cava Distensibility Index (IVCDI)	下腔静脉扩张指数
 Respiratory Variation of IVC	下腔静脉呼吸变异度
 - 艾司 ketamine是艾司氯胺酮
 - 巴雷受体应该翻译成压力感受器，是不是翻译没有参照glossary.md?
+- Stroke Volume (SV)每搏量（每搏输出量）Stroke Volume Variation (SVV)每搏量变异度Cardiac Output (CO)心输出量Cardiac Index (CI)心脏指数Pulse Pressure Variation (PPV)脉压变异度Cardiac Output Monitoring心输出量监测
