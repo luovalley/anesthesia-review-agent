@@ -3694,3 +3694,4 @@ Inferior Vena Cava Diameter	下腔静脉直径
 Inferior Vena Cava Collapsibility Index (IVCCI)	下腔静脉塌陷指数
 Inferior Vena Cava Distensibility Index (IVCDI)	下腔静脉扩张指数
 Respiratory Variation of IVC	下腔静脉呼吸变异度
+- 艾司 ketamine是艾司氯胺酮
