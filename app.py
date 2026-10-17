@@ -594,11 +594,13 @@ def search_pubmed(query, max_results):
         try:
             medline = article["MedlineCitation"]
             art = medline["Article"]
-            pmid = str(medline["PMID"])
+            pmid = str(medline["MedlineCitation"]["PMID"])
             
+            # 1. 提取标准摘要
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
             abstract_text = " ".join(str(x) for x in abs_list)
             
+            # 2. 检查是否有 PMCID（例如截图中的 PMC12049116）
             pmcid = ""
             pubmed_data = article.get("PubmedData", {})
             for id_elem in pubmed_data.get("ArticleIdList", []):
@@ -609,14 +611,18 @@ def search_pubmed(query, max_results):
             full_text = abstract_text
             source_desc = "PubMed (数据库摘要)"
 
+            # 3. 核心升级：如果存在 PMCID，直接通过 PMC 数据库获取开放全文！
             if pmcid:
                 try:
-                    pmc_handle = Entrez.efetch(db="pmc", id=pmcid.replace("PMC", ""), retmode="xml")
+                    pmc_id_num = pmcid.replace("PMC", "")
+                    pmc_handle = Entrez.efetch(db="pmc", id=pmc_id_num, retmode="xml")
                     pmc_data = pmc_handle.read()
                     pmc_handle.close()
+                    
+                    # 过滤 XML 标签，提取正文纯文本
                     clean_pmc_text = re.sub(r'<[^>]+>', ' ', pmc_data)
                     if len(clean_pmc_text) > len(abstract_text):
-                        full_text = clean_pmc_text[:6000]
+                        full_text = clean_pmc_text[:8000] # 截取前 8000 字符的详细全文
                         source_desc = "PubMed Central (PMC 开放全文)"
                 except Exception:
                     pass
@@ -627,7 +633,7 @@ def search_pubmed(query, max_results):
             rows.append({
                 "PMID/URL": f"PMID:{pmid}" + (f" | {pmcid}" if pmcid else ""),
                 "Title": str(art.get("ArticleTitle", "")),
-                "Abstract": full_text,
+                "Abstract": full_text,  # 传入的是包含详细正文的文本
                 "Year": year,
                 "Source": source_desc,
             })
