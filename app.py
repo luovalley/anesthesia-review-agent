@@ -736,15 +736,7 @@ def save_review_to_cloud(topic, content, tag="V1"):
     except Exception:
         return None
 
-    # 降级方案：若未配置 GitHub 凭证，则保存在本地临时目录（服务器重启后会丢失）
-    os.makedirs("saved_reviews", exist_ok=True)
-    local_filename = f"saved_reviews/{safe_name}_{tag}_{timestamp}.md"
-    try:
-        with open(local_filename, "w", encoding="utf-8") as f:
-            f.write(content)
-        return local_filename
-    except Exception:
-        return None
+
 
 def call_openrouter_with_fallback(client, primary_model, messages, temperature=0.3):
     models_to_try = [primary_model] + [m for m in FALLBACK_FREE_MODELS if m != primary_model]
