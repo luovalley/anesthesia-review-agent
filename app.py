@@ -210,16 +210,17 @@ def save_review_to_cloud(topic, content, tag="V1"):
         return None
 
 # ==================== 2. 侧边栏交互面板 ====================
+# ==================== 2. 侧边栏交互面板 ====================
 st.sidebar.title("🛠️ 配置")
 
-# 严格保留您原本的 API Key / Base URL / 模型名称配置区域（保持原样）
+# 原汁原味的 API 配置（保持原样，没有任何多余改动）
 api_key = st.sidebar.text_input("OpenAI / OpenRouter API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
 base_url = st.sidebar.text_input("API Base URL (可选)", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
 selected_model = st.sidebar.text_input("LLM 模型名称", value="gpt-4o")
 
 st.sidebar.markdown("---")
 
-# 主题输入框与 session_state 状态同步
+# 主题输入框
 if "default_topic" not in st.session_state:
     st.session_state["default_topic"] = "post-induction hypotension AND elderly"
 
@@ -228,30 +229,31 @@ topic_keywords = st.sidebar.text_input(
     value=st.session_state["default_topic"]
 )
 
-# 侧边栏新增：基于输入链接智能提取检索词功能
-st.sidebar.markdown("🔗 **根据链接自动提取关键词进行搜索**")
+# 下方新增：根据链接提取关键词
+st.sidebar.markdown("🔗 **根据链接自动提取关键词**")
 
 ref_url = st.sidebar.text_input(
-    "请输入参考网页/文章链接：", 
+    "请输入参考文章/网页链接：", 
     placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
     key="input_ref_url"
 )
 
-# 临时客户端用于侧边栏直接执行提取
-temp_client = OpenAI(api_key=api_key or "dummy", base_url=base_url) if api_key else None
-
 if st.sidebar.button("📥 读取链接并提取检索词", use_container_width=True):
-    if ref_url.strip() and temp_client:
-        with st.spinner("正在解析链接并提取核心检索词..."):
-            new_query = extract_keywords_from_url(ref_url.strip(), temp_client, selected_model)
-            if new_query:
-                st.session_state["default_topic"] = new_query
-                st.success(f"成功提取检索词：{new_query}")
-                st.rerun()
-            else:
-                st.warning("未能从该链接中提取到有效关键词。")
+    if ref_url.strip():
+        if not api_key:
+            st.sidebar.error("请先输入 API Key！")
+        else:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            with st.spinner("正在解析链接并提取核心检索词..."):
+                new_query = extract_keywords_from_url(ref_url.strip(), client, selected_model)
+                if new_query:
+                    st.session_state["default_topic"] = new_query
+                    st.sidebar.success(f"已提取检索词：{new_query}")
+                    st.rerun()
+                else:
+                    st.sidebar.warning("未能从该链接提取到关键词。")
     else:
-        st.warning("请先填写有效的 API Key 并输入网页链接。")
+        st.sidebar.warning("请输入有效链接。")
 
 st.sidebar.markdown("---")
 max_results = st.sidebar.slider("检索文献最大数量", 5, 50, 20)
