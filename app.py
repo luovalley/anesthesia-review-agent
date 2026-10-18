@@ -1178,6 +1178,35 @@ else:
     )
     search_topic = manual_input.strip()
 
+def extract_keywords_from_url(url, client, model):
+    """通过链接抓取网页内容，并利用大模型提取精准的 PubMed 英文检索词"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            # 过滤 HTML 标签获取纯文本，并截取前 4000 字符避免超出上下文
+            clean_text = re.sub(r'<[^>]+>', ' ', resp.text)
+            clean_text = re.sub(r'\s+', ' ', clean_text).strip()[:4000]
+            
+            prompt = f"""请阅读以下网页/文献页面的内容，提取其最核心的医学研究主题，并将其转化为适合 PubMed 数据库的高效英文检索表达式（包含必要的布尔逻辑词如 AND/OR，例如: Remimazolam AND post-induction hypotension）。
+要求：
+1. 只输出检索词表达式本身，绝对不要输出任何多余的解释、引号或前缀。
+2. 保持专业、精准。
+
+网页内容片段：
+{clean_text}"""
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            extracted_query = response.choices[0].message.content.strip().replace('"', '')
+            return extracted_query
+    except Exception as e:
+        st.error(f"解析链接失败: {e}")
+    return None
+
 st.sidebar.markdown("---")
 if st.sidebar.button("🔍 开始检索文献", type="primary", disabled=not search_topic):
     with st.spinner(f"正在通过 Tavily 全网与 PubMed / PMC 全文检索【{search_topic}】近 5 年文献..."):
