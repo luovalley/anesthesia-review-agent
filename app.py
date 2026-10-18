@@ -1177,6 +1177,36 @@ else:
         value=default_text, placeholder="例如：Remimazolam vs Propofol sedation",
     )
     search_topic = manual_input.strip()
+# 1. 原有的主题输入框（假设存放在 st.session_state 中或直接作为变量）
+topic_keywords = st.sidebar.text_input(
+    "请确认或手动修改检索主题", 
+    value=st.session_state.get("default_topic", "post-induction hypotension AND elderly")
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("🔗 **或通过参考链接智能提取**")
+
+# 2. 新增的链接输入框与解析按钮
+ref_url = st.sidebar.text_input(
+    "请输入参考文章/网页链接：", 
+    placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
+    key="input_ref_url"
+)
+
+if st.sidebar.button("📥 读取链接并提取检索词", use_container_width=True):
+    if ref_url.strip():
+        with st.spinner("正在抓取网页并提取核心检索词..."):
+            # 调用刚刚定义好的提取函数（传入当前的 client 和选择的模型）
+            new_query = extract_keywords_from_url(ref_url.strip(), client, selected_model)
+            if new_query:
+                # 动态更新 session_state 或直接赋给检索主题
+                st.session_state["default_topic"] = new_query
+                st.success(f"成功提取检索词：{new_query}")
+                st.rerun()  # 刷新页面以在输入框中生效
+            else:
+                st.warning("未能从该链接中提取到有效关键词，请检查链接是否有效。")
+    else:
+      st.warning("请先输入有效的网址链接。")
 
 def extract_keywords_from_url(url, client, model):
     """通过链接抓取网页内容，并利用大模型提取精准的 PubMed 英文检索词"""
