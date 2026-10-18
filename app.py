@@ -1440,8 +1440,8 @@ st.markdown("---")
 
 all_docs = pd.concat([local_df, web_df], ignore_index=True)
 
-tab1, tab2, tab3 = st.tabs(
-    ["📝 深度知识更新文章", "📚 数据库与全网文献明细", "📖 术语表管理"]
+tab1, tab2 = st.tabs(
+    ["📝 深度知识更新文章", "📚 数据库与全网文献明细"]
 )
 
 with tab1:
@@ -1590,20 +1590,3 @@ with tab2:
         )
     else:
         st.info("暂无文献数据。")
-
-with tab3:
-    st.subheader("📖 专业术语表 (glossary.md) 管理")
-    st.markdown("在此维护中英对照的医学专业词汇，保证大模型生成的中文综述译名一致。每行一条，如：`hypotension - 低血压`。")
-    if ss.pop("_glossary_saved", False):
-        st.success("术语表保存成功！")
-    current_glossary = load_glossary_content()
-    edited_glossary = st.text_area("编辑 glossary.md 内容", value=current_glossary, height=300)
-    if st.button("💾 保存术语表"):
-        try:
-            with open("glossary.md", "w", encoding="utf-8") as f:
-                f.write(edited_glossary)
-            ss["_glossary_saved"] = True
-            st.rerun()
-        except Exception as e:
-            st.error(f"保存失败: {e}")
-    st.caption("提示：Streamlit Cloud 的本地文件在应用重启后可能丢失，长期使用请把 glossary.md 同步到代码仓库。")
