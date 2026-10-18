@@ -10,7 +10,6 @@ import time
 from collections import Counter
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from Bio import Entrez
 from openai import OpenAI
@@ -1441,8 +1440,8 @@ st.markdown("---")
 
 all_docs = pd.concat([local_df, web_df], ignore_index=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📝 深度知识更新文章", "📚 数据库与全网文献明细", "🔥 课题热点图表", "📖 术语表管理"]
+tab1, tab2, tab3 = st.tabs(
+    ["📝 深度知识更新文章", "📚 数据库与全网文献明细", "📖 术语表管理"]
 )
 
 with tab1:
@@ -1593,51 +1592,6 @@ with tab2:
         st.info("暂无文献数据。")
 
 with tab3:
-    st.subheader("当前文献集的 33 项热点映射分类")
-    if not all_docs.empty:
-        texts = all_docs["Title"].fillna("").astype(str) + " " + all_docs["Abstract"].fillna("").astype(str)
-        topics_list = []
-        for text in texts:
-            topics_list.extend(extract_clinical_topics(text))
-
-        if topics_list:
-            df_counts = pd.DataFrame(Counter(topics_list).most_common(), columns=["热点主题", "匹配频次"])
-            fig = px.bar(
-                df_counts, x="匹配频次", y="热点主题", orientation="h",
-                color="匹配频次", color_continuous_scale="Reds",
-            )
-            fig.update_layout(
-                yaxis=dict(autorange="reversed"),
-                height=max(400, len(df_counts) * 25),
-            )
-            st.plotly_chart(fig, **STRETCH)
-        else:
-            st.info("未发现匹配的预设热点。")
-
-        st.markdown("---")
-        st.subheader("💊 当前文献集中讨论最热门的药物（自动提取）")
-        st.caption(
-            "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
-            "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
-        )
-        hot_df = extract_hot_drugs(all_docs, top_n=15)
-        if not hot_df.empty:
-            fig2 = px.bar(
-                hot_df, x="涉及文献数", y="药物", orientation="h",
-                color="涉及文献数", color_continuous_scale="Blues",
-            )
-            fig2.update_layout(
-                yaxis=dict(autorange="reversed"),
-                height=max(350, len(hot_df) * 30),
-            )
-            st.plotly_chart(fig2, **STRETCH)
-            st.dataframe(hot_df, hide_index=True, **STRETCH)
-        else:
-            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
-    else:
-        st.info("暂无文献数据。")
-
-with tab4:
     st.subheader("📖 专业术语表 (glossary.md) 管理")
     st.markdown("在此维护中英对照的医学专业词汇，保证大模型生成的中文综述译名一致。每行一条，如：`hypotension - 低血压`。")
     if ss.pop("_glossary_saved", False):
