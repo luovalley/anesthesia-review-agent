@@ -691,16 +691,22 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
 # 5. AI 综述生成引擎与云端自动存储
 # ==========================================
 def save_review_to_cloud(topic, content, tag="V1"):
-    """优先尝试通过 GitHub API 保存到远端仓库的 reviews/ 文件夹中，失败则降级保存到本地临时目录"""
-    safe_name = re.sub(r'[\\/:*?"<>|]', "_", topic)
+    """安全地将综述保存到远端仓库的 reviews/ 文件夹中，自动限制文件名长度以防止报错"""
+    # 1. 过滤掉所有特殊符号、空格、括号等，并将主题简化压缩到安全长度内
+    clean_topic = re.sub(r'[\\/:*?"<>|\s()]+', "_", str(topic)).strip("_")
+    if len(clean_topic) > 40:
+        clean_topic = clean_topic[:40] + "_etc"
+    if not clean_topic:
+        clean_topic = "Anesthesia_Review"
+        
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path_in_repo = f"reviews/{safe_name}_{tag}_{timestamp}.md"
+    file_path_in_repo = f"reviews/{clean_topic}_{tag}_{timestamp}.md"
     
     token = os.getenv("GITHUB_TOKEN", "").strip()
     repo = os.getenv("GITHUB_REPO", "").strip()
     branch = os.getenv("GITHUB_BRANCH", "main").strip()
 
-    # 如果配置了 GitHub API 凭证，直接通过 API 提交并保存在 GitHub 仓库中
+    # 如果配置了 GitHub API 凭证，通过 API 提交并保存在 GitHub 仓库中
     if token and repo:
         url = f"https://api.github.com/repos/{repo}/contents/{file_path_in_repo}"
         headers = {
@@ -710,7 +716,7 @@ def save_review_to_cloud(topic, content, tag="V1"):
         try:
             encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
             payload = {
-                "message": f"Auto-save review: {safe_name} ({tag})",
+                "message": f"Auto-save review: {clean_topic} ({tag})",
                 "content": encoded_content,
                 "branch": branch
             }
@@ -719,6 +725,16 @@ def save_review_to_cloud(topic, content, tag="V1"):
                 return file_path_in_repo
         except Exception:
             pass
+
+    # 降级方案：若未配置 GitHub 凭证，则保存在本地临时目录
+    os.makedirs("saved_reviews", exist_ok=True)
+    local_filename = f"saved_reviews/{clean_topic}_{tag}_{timestamp}.md"
+    try:
+        with open(local_filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        return local_filename
+    except Exception:
+        return None
 
     # 降级方案：若未配置 GitHub 凭证，则保存在本地临时目录（服务器重启后会丢失）
     os.makedirs("saved_reviews", exist_ok=True)
