@@ -2,28 +2,29 @@ import os
 import re
 import base64
 import datetime
+import requests
 import urllib.request
 import pandas as pd
 import streamlit as st
 from Bio import Entrez
 from openai import OpenAI
 
-# ==================== 0. 配置初始化与全局常量 ====================
+# ==================== 0. 全局配置与初始化 ====================
 st.set_page_config(
     page_title="麻醉学与围术期医学前沿文献深度综述与智能检索系统",
     page_icon="🩺",
     layout="wide"
 )
 
-# 设置 Entrez 邮箱（NCBI 推荐规范）
+# NCBI E-utilities 推荐配置邮箱
 Entrez.email = os.getenv("NCBI_EMAIL", "anesthesia_agent@example.com")
 
 DOC_COLUMNS = ["PMID/URL", "Title", "Abstract", "Year", "Source"]
 
-# ==================== 1. 辅助函数与后端逻辑 ====================
+# ==================== 1. 后端数据与工具函数 ====================
 
 def load_glossary_content():
-    """加载本地或远端的 glossary.md 专业术语对照表"""
+    """加载本地专业术语对照表 (glossary.md)"""
     if os.path.exists("glossary.md"):
         try:
             with open("glossary.md", "r", encoding="utf-8") as f:
@@ -33,6 +34,7 @@ def load_glossary_content():
     return ""
 
 def _pubmed_esearch(term, retmax):
+    """PubMed 基础搜索辅助函数"""
     handle = Entrez.esearch(db="pubmed", term=term, retmax=retmax, sort="relevance")
     try:
         return Entrez.read(handle).get("IdList", [])
@@ -46,7 +48,7 @@ def get_past_5_years_date_filter():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_pubmed(query, max_results):
-    """支持标准摘要抓取及增强版 PMC 开放全文提取的 PubMed 检索函数"""
+    """支持标准摘要抓取与增强型 PMC 开放全文解析的 PubMed 检索函数"""
     date_filter = get_past_5_years_date_filter()
     id_list = _pubmed_esearch(f"({query}) AND {date_filter}", max_results)
 
@@ -68,11 +70,11 @@ def search_pubmed(query, max_results):
             art = medline["Article"]
             pmid = str(medline["PMID"])
             
-            # 1. 提取标准摘要作为基础保底
+            # 1. 基础摘要抓取
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
             abstract_text = " ".join(str(x) for x in abs_list)
             
-            # 2. 安全提取 PMCID
+            # 2. 识别 PMCID
             pmcid = ""
             pubmed_data = article.get("PubmedData", {})
             for id_elem in pubmed_data.get("ArticleIdList", []):
@@ -83,7 +85,7 @@ def search_pubmed(query, max_results):
             full_text = abstract_text
             source_desc = "PubMed (数据库摘要)"
 
-            # 3. 增强版 PMC 开放全文自动抓取
+            # 3. 增强型 PMC 开放全文多途径提取
             if pmcid:
                 pmc_num = pmcid.replace("PMC", "").strip()
                 try:
@@ -95,7 +97,7 @@ def search_pubmed(query, max_results):
                     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
                     
                     if len(clean_text) > len(abstract_text) + 200:
-                        full_text = clean_text[:8000]  # 截取前 8000 字符详细正文
+                        full_text = clean_text[:8000]
                         source_desc = "PubMed Central (PMC 开放全文)"
                 except Exception:
                     try:
@@ -125,7 +127,7 @@ def search_pubmed(query, max_results):
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
 
 def extract_keywords_from_url(url, client, model):
-    """通过参考链接抓取网页内容，并利用大模型提取精准的 PubMed 英文检索词"""
+    """根据输入的网页/文献链接，抓取页面并由大模型提取标准的 PubMed 检索关键词"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         resp = requests.get(url, headers=headers, timeout=10)
@@ -154,12 +156,12 @@ def extract_keywords_from_url(url, client, model):
 
 def save_review_to_cloud(topic, content, tag="V1"):
     """
-    通过 GitHub API 安全将综述保存到远端 reviews/ 目录。
-    强制以文章主题命名，并对特殊符号与文件名长度进行严格截断与清洗。
+    通过 GitHub API 安全将综述保存至远端 reviews/ 目录。
+    强制使用干净的文章主题名称作为文件名，严格剥离逻辑词并限制安全字符长度，彻底防止 File name too long 错误。
     """
     topic_str = str(topic).strip()
     
-    # 自动过滤误传的布尔检索表达式
+    # 自动识别并剥离传入的 PubMed 逻辑表达式
     if " OR " in topic_str or " AND " in topic_str or "_postinduction" in topic_str:
         clean_terms = re.sub(r'[\(\)_]', '', topic_str)
         first_term = clean_terms.split(" OR ")[0].split(" AND ")[0].strip()
@@ -197,7 +199,7 @@ def save_review_to_cloud(topic, content, tag="V1"):
         except Exception:
             pass
 
-    # 本地降级存储
+    # 本地降级保存
     os.makedirs("saved_reviews", exist_ok=True)
     local_filename = f"saved_reviews/{clean_topic}_{tag}_{timestamp}.md"
     try:
@@ -207,41 +209,40 @@ def save_review_to_cloud(topic, content, tag="V1"):
     except Exception:
         return None
 
-# ==================== 2. 侧边栏配置面板 ====================
-st.sidebar.title("🛠️ 麻醉学文献综述工作台")
+# ==================== 2. 侧边栏交互面板 ====================
+st.sidebar.title("🛠️ 配置")
 
-# API 配置
+# 严格保留您原本的 API Key / Base URL / 模型名称配置区域（保持原样）
 api_key = st.sidebar.text_input("OpenAI / OpenRouter API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
 base_url = st.sidebar.text_input("API Base URL (可选)", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
 selected_model = st.sidebar.text_input("LLM 模型名称", value="gpt-4o")
 
 st.sidebar.markdown("---")
 
-# 初始化 session state 用于默认主题与联动
+# 主题输入框与 session_state 状态同步
 if "default_topic" not in st.session_state:
     st.session_state["default_topic"] = "post-induction hypotension AND elderly"
 
-# 主题输入框
 topic_keywords = st.sidebar.text_input(
     "请确认或手动修改检索主题", 
     value=st.session_state["default_topic"]
 )
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("🔗 **或通过参考链接智能提取**")
+# 侧边栏新增：基于输入链接智能提取检索词功能
+st.sidebar.markdown("🔗 **根据链接自动提取关键词进行搜索**")
 
 ref_url = st.sidebar.text_input(
-    "请输入参考文章/网页链接：", 
+    "请输入参考网页/文章链接：", 
     placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
     key="input_ref_url"
 )
 
-# 初始化临时客户端以支持侧边栏的链接解析
+# 临时客户端用于侧边栏直接执行提取
 temp_client = OpenAI(api_key=api_key or "dummy", base_url=base_url) if api_key else None
 
 if st.sidebar.button("📥 读取链接并提取检索词", use_container_width=True):
     if ref_url.strip() and temp_client:
-        with st.spinner("正在抓取网页并提取核心检索词..."):
+        with st.spinner("正在解析链接并提取核心检索词..."):
             new_query = extract_keywords_from_url(ref_url.strip(), temp_client, selected_model)
             if new_query:
                 st.session_state["default_topic"] = new_query
@@ -250,15 +251,15 @@ if st.sidebar.button("📥 读取链接并提取检索词", use_container_width=
             else:
                 st.warning("未能从该链接中提取到有效关键词。")
     else:
-        st.warning("请先配置 API Key 并输入有效的网址链接。")
+        st.warning("请先填写有效的 API Key 并输入网页链接。")
 
 st.sidebar.markdown("---")
 max_results = st.sidebar.slider("检索文献最大数量", 5, 50, 20)
 enable_glossary = st.sidebar.checkbox("启用专业术语表对齐 (glossary.md)", value=True)
 
-# ==================== 3. 主界面布局与核心交互 ====================
+# ==================== 3. 主页面与综述生成流程 ====================
 st.title("🩺 麻醉学与围术期医学前沿文献深度综述系统")
-st.markdown("基于 **PubMed/PMC 开放全文数据库**、**大模型多维归纳** 与 **GitHub 云端持久化** 的智能学术综述生成平台。")
+st.markdown("结合 **PubMed/PMC 开放全文数据**、**硬核量化数据萃取 Prompt** 与 **GitHub 云端保存** 的麻醉学学术综述工具。")
 
 tab1, tab2, tab3 = st.tabs(["🚀 生成综述主面板", "📚 数据库与全网文献明细", "📖 术语表管理"])
 
@@ -271,16 +272,16 @@ with tab1:
 
     if run_btn:
         if not api_key:
-            st.error("请先在左侧侧边栏输入您的 API Key！")
+            st.error("请先在左侧侧边栏配置您的 API Key！")
         else:
             client = OpenAI(api_key=api_key, base_url=base_url)
             
             with st.status("正在进行多源学术检索与全文解析...", expanded=True) as status:
-                st.write("正在连接 PubMed/PMC 数据库进行近 5 年文献深度检索...")
+                st.write("正在检索 PubMed/PMC 近 5 年相关文献...")
                 df_pubmed = search_pubmed(topic_keywords, max_results)
-                status.update(label=f"成功获取 {len(df_pubmed)} 篇文献（含 PMC 开放全文）", state="running")
+                status.update(label=f"成功获取 {len(df_pubmed)} 篇文献（已包含 PMC 开放全文）", state="running")
                 
-                # 组装背景资料
+                # 拼接背景文献资料
                 combined_input = ""
                 for idx, row in df_pubmed.iterrows():
                     combined_input += (
@@ -290,7 +291,7 @@ with tab1:
                         f"详细内容/摘要节选:\n{row['Abstract']}\n\n"
                     )
                 
-                # 加载术语表
+                # 加载并附带大小写不敏感术语表指令
                 glossary_section = ""
                 if enable_glossary:
                     glossary_text = load_glossary_content()
@@ -303,7 +304,7 @@ with tab1:
 
 **⚠️ 核心硬性要求**：
 1. **大小写不敏感匹配**：无论背景资料中的英文专业名词是大写、小写还是复数形式，**在中文正文中都必须严格翻译并替换为词典中对应的中文专业译名**。
-2. 绝对不允许在中文正文里直接大段保留未翻译的英文核心病名、药名或生理指标。
+2. 绝对不允许在中文正文里直接大段保留未翻译的英文核心病名、药名或生理指标（如不得直接出现 "hypotension"，必须译为“低血压”）。
 """
 
                 today = datetime.datetime.now()
@@ -354,7 +355,7 @@ with tab1:
 5. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID。
 """
 
-                st.write("正在交由大模型进行深度综合归纳与硬核数据萃取...")
+                st.write("正在由大模型分析提取全文核心数据并撰写综述...")
                 response = client.chat.completions.create(
                     model=selected_model,
                     messages=[{"role": "user", "content": prompt}],
@@ -370,34 +371,30 @@ with tab1:
                         review_placeholder.markdown(full_review_content + "▌")
                 
                 review_placeholder.markdown(full_review_content)
-                status.update(label="综述生成完毕！正在自动同步至 GitHub 远端...", state="complete")
+                status.update(label="综述生成完毕！正在进行云端同步保存...", state="complete")
 
-            # 自动云端持久化（以文章主题命名，防止文件名过长）
+            # 云端保存（传入主题名称，安全截断）
             saved_path = save_review_to_cloud(topic=topic_keywords, content=full_review_content, tag="V1")
             if saved_path:
-                st.success(f"🎉 综述已成功加密同步至云端仓库路径: `{saved_path}`")
+                st.success(f"🎉 综述已成功持久化保存至云端仓库: `{saved_path}`")
             else:
-                st.warning("⚠️ 云端同步失败，已保存在本地 `saved_reviews/` 目录中。")
+                st.warning("⚠️ 云端推送失败，已作为副本保存在本地 `saved_reviews/` 目录中。")
 
 with tab2:
     st.subheader("📚 数据库检索结果与全文状态明细")
-    st.markdown("在此可核查当前检索到的文献来源（是 PMC 开放全文还是标准数据库摘要）。")
-    if st.button("🔄 刷新文献列表"):
+    if st.button("🔄 刷新数据库明细列表"):
         st.rerun()
     
-    # 快速预览检索结果
     preview_df = search_pubmed(topic_keywords, max_results)
     if not preview_df.empty:
         st.dataframe(preview_df, use_container_width=True)
     else:
-        st.info("当前暂无检索结果，请在主面板点击生成或调整检索主题。")
+        st.info("暂无检索结果，请在主面板点击生成或在侧边栏调整检索主题。")
 
 with tab3:
     st.subheader("📖 专业术语表 (glossary.md) 管理")
-    st.markdown("在此维护双语医学专业词汇，确保大模型生成的中文综述专业词汇翻译一致。")
-    
     current_glossary = load_glossary_content()
-    edited_glossary = st.text_area("编辑 glosssary.md 内容", value=current_glossary, height=300)
+    edited_glossary = st.text_area("编辑 glossary.md 内容", value=current_glossary, height=300)
     
     if st.button("💾 保存术语表"):
         try:
