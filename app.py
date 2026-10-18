@@ -616,15 +616,16 @@ def search_pubmed(query, max_results):
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
 
 
-def extract_keywords_from_url(url, api_key, model):
-    """读取参考链接（PubMed 链接直接走 Entrez），由大模型提取英文检索关键词。
-    返回 (关键词 或 None, 错误信息 或 None)。"""
+def fetch_page_text(url, tavily_key=""):
+    """多级回退读取链接内容：PubMed/PMC(Entrez) → DOI(Crossref) → 直接抓取(完整浏览器头)
+    → Tavily Extract → 仅用链接地址中的单词推测。返回 (文本, 提示信息)。"""
     import requests
+    from urllib.parse import urlparse, unquote
 
-    page_text = ""
-    try:
-        pm = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url)
-        if pm:
+    # 1. PubMed 链接
+    pm = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url)
+    if pm:
+        try:
             h = Entrez.efetch(db="pubmed", id=pm.group(1), retmode="xml")
             try:
                 rec = Entrez.read(h)
@@ -632,25 +633,102 @@ def extract_keywords_from_url(url, api_key, model):
                 h.close()
             art = rec["PubmedArticle"][0]["MedlineCitation"]["Article"]
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
-            page_text = f"{art.get('ArticleTitle', '')} " + " ".join(str(x) for x in abs_list)
-        else:
-            resp = requests.get(
-                url, timeout=15,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            return f"{art.get('ArticleTitle', '')} " + " ".join(str(x) for x in abs_list), None
+        except Exception:
+            pass
+
+    # 2. PMC 链接
+    pmc = re.search(r"PMC(\d+)", url, flags=re.IGNORECASE)
+    if pmc:
+        try:
+            h = Entrez.efetch(db="pmc", id=pmc.group(1), retmode="xml")
+            try:
+                raw = h.read()
+            finally:
+                h.close()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            txt = _xml_to_text(raw)[:4000]
+            if len(txt) > 100:
+                return txt, None
+        except Exception:
+            pass
+
+    # 3. 链接中含 DOI → Crossref（不会拦截，返回标题与摘要）
+    doi = re.search(r"(10\.\d{4,9}/[^\s?#]+)", unquote(url))
+    if doi:
+        try:
+            r = requests.get(
+                f"https://api.crossref.org/works/{doi.group(1).rstrip('/.')}",
+                timeout=15, headers={"User-Agent": "anesthesia-review-app (mailto:anesthesia_agent@example.com)"},
             )
-            if resp.status_code != 200:
-                return None, f"网页返回 HTTP {resp.status_code}"
-            page_text = _xml_to_text(resp.text)
-        page_text = page_text[:4000]
-        if len(page_text) < 30:
-            return None, "未能从该链接读取到有效正文"
+            if r.status_code == 200:
+                msg = r.json().get("message", {})
+                title = " ".join(msg.get("title", []))
+                abstract = _xml_to_text(msg.get("abstract", ""))
+                if title:
+                    return f"{title} {abstract}", None
+        except Exception:
+            pass
+
+    # 4. 直接抓取（完整浏览器请求头）
+    status = None
+    try:
+        resp = requests.get(
+            url, timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/",
+            },
+        )
+        status = resp.status_code
+        if status == 200:
+            txt = _xml_to_text(resp.text)[:4000]
+            if len(txt) >= 100:
+                return txt, None
+    except Exception as e:
+        status = f"连接失败: {e}"
+
+    # 5. Tavily Extract（可绕过多数反爬）
+    if tavily_key:
+        try:
+            r = requests.post(
+                "https://api.tavily.com/extract",
+                headers={"Authorization": f"Bearer {tavily_key}", "Content-Type": "application/json"},
+                json={"urls": [url]}, timeout=60,
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                if results and results[0].get("raw_content"):
+                    return str(results[0]["raw_content"])[:4000], None
+        except Exception:
+            pass
+
+    # 6. 最后手段：用链接路径里的英文单词推测主题
+    slug = unquote(urlparse(url).path)
+    words = [w for w in re.split(r"[^A-Za-z]+", slug) if len(w) > 2]
+    if len(words) >= 3:
+        return " ".join(words), f"网页无法访问（{status}），已仅根据链接地址中的单词推测主题，结果仅供参考"
+
+    return "", f"网页无法访问（{status}）。请直接复制文章标题/摘要里的英文关键词填入主题框，或改用 PubMed / DOI 链接"
+
+
+def extract_keywords_from_url(url, api_key, model, tavily_key=""):
+    """读取参考链接并由大模型提取英文检索关键词。返回 (关键词或None, 提示或错误信息)。"""
+    try:
+        page_text, note = fetch_page_text(url, tavily_key)
+        if len(page_text.strip()) < 15:
+            return None, note or "未能从该链接读取到有效内容"
 
         client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
         prompt = (
             "请阅读以下网页/文献内容，提取其最核心的医学研究主题，"
             "输出 3-6 个适合 PubMed 与网页检索的英文关键词，用空格分隔。\n"
             "要求：只输出关键词本身；不要布尔运算符（AND/OR）、括号、引号、标点或任何解释。\n\n"
-            f"内容：\n{page_text}"
+            f"内容：\n{page_text[:4000]}"
         )
         text, _, _ = call_openrouter_with_fallback(
             client, model, [{"role": "user", "content": prompt}], temperature=0.1
@@ -660,7 +738,7 @@ def extract_keywords_from_url(url, api_key, model):
         words = line.split()[:6]
         if not words:
             return None, "大模型未返回有效关键词"
-        return " ".join(words), None
+        return " ".join(words), note
     except Exception as e:
         return None, str(e)
 
@@ -1229,10 +1307,12 @@ if st.sidebar.button("📥 读取链接并提取检索词"):
         ss["url_msg"] = ("warning", "请先配置 OpenRouter API Key（用于提取关键词）。")
     else:
         with st.spinner("正在读取链接并提取核心检索词..."):
-            _q, _err = extract_keywords_from_url(ref_url.strip(), openrouter_api_key, openrouter_model)
+            _q, _err = extract_keywords_from_url(
+                ref_url.strip(), openrouter_api_key, openrouter_model, tavily_api_key
+            )
         if _q:
             ss["custom_topic_input" if work_mode == MODE_1 else "manual_topic_input"] = _q
-            ss["url_msg"] = ("success", f"已提取检索词并填入主题框：{_q}")
+            ss["url_msg"] = ("success", f"已提取检索词并填入主题框：{_q}" + (f"\n\n⚠️ {_err}" if _err else ""))
             st.rerun()
         else:
             ss["url_msg"] = ("warning", f"未能提取检索词：{_err}")
