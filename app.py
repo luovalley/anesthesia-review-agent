@@ -1,29 +1,98 @@
-import os
-import re
 import base64
 import datetime
-import urllib.request
+import hmac
+import html
+import inspect
+import io
+import os
+import re
+import time
+from collections import Counter
+
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from Bio import Entrez
 from openai import OpenAI
 
-# ==================== 0. 配置初始化与全局常量 ====================
+# set_page_config 必须是第一个 Streamlit 命令
 st.set_page_config(
-    page_title="麻醉学与围术期医学前沿文献深度综述与智能检索系统",
-    page_icon="🩺",
-    layout="wide"
+    page_title="麻醉学全网文献热点追踪与知识更新综述系统",
+    page_icon="💉",
+    layout="wide",
 )
 
-# 设置 Entrez 邮箱（NCBI 推荐规范）
-Entrez.email = os.getenv("NCBI_EMAIL", "anesthesia_agent@example.com")
+# ==========================================
+# 1. 凭证加载（Streamlit Secrets -> 环境变量）
+# ==========================================
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, (str, int, float)):
+            os.environ.setdefault(_k, str(_v))
+except Exception:
+    pass
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+def normalize_key(v):
+    """去掉首尾空白、换行和误带的引号。"""
+    return str(v or "").strip().strip("\"'“”‘’").strip()
+
+
+NCBI_EMAIL = os.getenv("NCBI_EMAIL", "").strip()
+NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
+ENV_TAVILY_KEY = normalize_key(os.getenv("TAVILY_API_KEY", ""))
+ENV_OPENROUTER_KEY = normalize_key(os.getenv("OPENROUTER_API_KEY", ""))
+
+Entrez.email = NCBI_EMAIL or "anesthesia_agent@example.com"  # NCBI 要求提供邮箱
+Entrez.api_key = NCBI_API_KEY or None
+
+DEFAULT_OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
+)
+FALLBACK_FREE_MODELS = [
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "qwen/qwen3.8-27b:free",
+    "google/gemma-4-31b-it:free",
+    "apodex/apodex-1.1-mini:free",
+    "openrouter/free",
+]
 
 DOC_COLUMNS = ["PMID/URL", "Title", "Abstract", "Year", "Source"]
+TAVILY_MAX_RESULTS = 20
 
-# ==================== 1. 辅助函数与后端逻辑 ====================
+# PMC 开放全文抓取与提示词截断参数
+PMC_FULLTEXT_MAX = 8          # 每次检索最多抓取多少篇 PMC 全文（控制耗时）
+PMC_FULLTEXT_CHARS = 5000     # 每篇全文节选字符数
+PROMPT_CHARS_ABSTRACT = 1500  # 送入大模型的单篇摘要上限
+PROMPT_CHARS_FULLTEXT = 4500  # 送入大模型的单篇 PMC 全文节选上限
+
+try:
+    _ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+except Exception:
+    _ver = (0, 0)
+STRETCH = {"width": "stretch"} if _ver >= (1, 49) else {"use_container_width": True}
+
+
+# ==========================================
+# 访问密码保护与退出登录逻辑
+# ==========================================
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+MAX_FAILS = 5
+LOCK_WINDOW = 600
+
+
+@st.cache_resource
+def _login_tracker():
+    return {"fails": []}
+
 
 def load_glossary_content():
-    """加载本地或远端的 glossary.md 专业术语对照表"""
     if os.path.exists("glossary.md"):
         try:
             with open("glossary.md", "r", encoding="utf-8") as f:
@@ -32,6 +101,421 @@ def load_glossary_content():
             pass
     return ""
 
+
+def render_auth_header():
+    """在侧边栏最顶部渲染退出登录按钮和词典加载状态"""
+    ss = st.session_state
+    if ss.get("_auth_ok"):
+        if st.sidebar.button("🔒 退出登录", key="btn_logout"):
+            ss.clear()
+            st.rerun()
+
+    glossary_content = load_glossary_content()
+    lines = [l.strip() for l in glossary_content.splitlines() if l.strip()]
+    term_count = 0
+    for line in lines:
+        if line.startswith(("-", "*")) or ":" in line or "—" in line or "-" in line:
+            term_count += 1
+    
+    if term_count == 0 and glossary_content.strip():
+        term_count = len(lines)
+
+    if glossary_content.strip():
+        st.sidebar.success(f"✅ 专业词典加载成功 (共收录 {term_count} 条核心术语)")
+    else:
+        st.sidebar.warning("⚠️ 未检测到 glossary.md 或词典为空")
+
+    st.sidebar.markdown("---")
+
+
+def require_password():
+    ss = st.session_state
+    if ss.get("_auth_ok"):
+        return
+
+    st.title("🔐 请输入访问密码")
+    if not APP_PASSWORD:
+        st.error("管理员尚未配置访问密码（Secrets 中的 APP_PASSWORD），应用已锁定。")
+        st.stop()
+
+    tracker = _login_tracker()
+    now = time.time()
+    tracker["fails"] = [t for t in tracker["fails"] if now - t < LOCK_WINDOW]
+    if len(tracker["fails"]) >= MAX_FAILS:
+        wait_min = int((LOCK_WINDOW - (now - tracker["fails"][0])) // 60) + 1
+        st.error(f"错误次数过多，已暂时锁定，请约 {wait_min} 分钟后再试。")
+        st.stop()
+
+    _ac = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
+    with st.form("login_form", clear_on_submit=True):
+        pwd = st.text_input("访问密码", type="password", **_ac)
+        submitted = st.form_submit_button("进入", type="primary")
+
+    if submitted:
+        if hmac.compare_digest(pwd.encode("utf-8"), APP_PASSWORD.encode("utf-8")):
+            ss["_auth_ok"] = True
+            tracker["fails"].clear()
+            st.rerun()
+        else:
+            tracker["fails"].append(time.time())
+            time.sleep(1)
+            st.error("密码错误。")
+    st.stop()
+
+
+require_password()
+
+# 2. 权威临床与科研核心主题映射字典（共 33 项）
+DRUG_STEMS = (
+    "caine", "flurane", "zolam", "tomidine", "tomidate", "fentanil", "fentanyl",
+    "ofol", "curonium", "curium", "ketamine", "setron", "phine", "morphone", "adol",
+    "stigmine", "gammadex", "methasone", "rolac", "profen", "phrine", "drine",
+    "olol", "pentin", "galin", "pental", "barbital", "trexone", "oxone",
+)
+DRUG_PATTERN = r"\b[a-z]*(?:" + "|".join(DRUG_STEMS) + r")\b"
+DRUG_EXCLUDE = {"curium", "josephine", "delphine"}
+
+CLINICAL_TOPICS = {
+    "术中低血压 (Intraoperative Hypotension)": (
+        r"\b(intraoperative hypotension|hypotension|low blood pressure)\b"
+    ),
+    "超声引导神经阻滞 (Ultrasound-guided Nerve Block)": (
+        r"\b(ultrasound-guided|nerve block|regional anesthesia|brachial plexus"
+        r" block|femoral nerve block|erector spinae|fascial plane block)\b"
+    ),
+    "衰弱/老年麻醉 (Frailty & Geriatric Anesthesia)": (
+        r"\b(frailty|frail|elderly|geriatric|cognitive decline|postoperative"
+        r" delirium)\b"
+    ),
+    "麻醉深度监测 (Depth of Anesthesia)": (
+        r"\b(depth of anesthesia|bispectral index|bis|eeg|electroencephalogram|processed"
+        r" eeg)\b"
+    ),
+    "术后恶心呕吐 (PONV)": (
+        r"\b(ponv|postoperative nausea|vomiting|antiemetic)\b"
+    ),
+    "术后认知功能障碍 (POCD)": (
+        r"\b(pocd|postoperative cognitive dysfunction|cognitive"
+        r" impairment)\b"
+    ),
+    "气道管理/困难气道 (Airway Management)": (
+        r"\b(airway management|difficult airway|videolaryngoscopy|endotracheal"
+        r" intubation|laryngeal mask)\b"
+    ),
+    "围术期器官保护 (Organ Protection)": (
+        r"\b(myocardial injury|acute kidney injury|aki|lung injury|organ"
+        r" protection|ischemia-reperfusion)\b"
+    ),
+    "疼痛管理/多模式镇痛 (Multimodal Analgesia)": (
+        r"\b(multimodal analgesia|opioid-sparing|postoperative pain|chronic"
+        r" pain|analgesic)\b"
+    ),
+    "麻醉药物 (Anesthetic drugs)": DRUG_PATTERN,
+    "人工智能/机器学习应用 (AI in Anesthesia)": (
+        r"\b(artificial intelligence|machine learning|deep learning|predictive"
+        r" model|algorithm)\b"
+    ),
+    "日间/短程麻醉 (Ambulatory Anesthesia)": (
+        r"\b(ambulatory|day-surgery|outpatient anesthesia|same-day surgery)\b"
+    ),
+    "目标导向液体治疗 (GDFT)": (
+        r"\b(gdft|goal-directed fluid|fluid therapy|hemodynamic monitoring)\b"
+    ),
+    "小儿麻醉/发育毒性 (Pediatric Anesthesia & Neurotoxicity)": (
+        r"\b(pediatric anesthesia|pediatric|neonatal|infant|developmental"
+        r" neurotoxicity|anesthetic-induced neurotoxicity)\b"
+    ),
+    "产科麻醉与镇痛 (Obstetric Anesthesia)": (
+        r"\b(obstetric|parturient|cesarean section|epidural labor"
+        r" analgesia|postpartum hemorrhage)\b"
+    ),
+    "心胸麻醉/体外循环 (Cardiothoracic Anesthesia)": (
+        r"\b(cardiothoracic|cardiac surgery|cardiopulmonary bypass|thoracic"
+        r" anesthesia|one-lung ventilation)\b"
+    ),
+    "神经外科麻醉 (Neuroanesthesia)": (
+        r"\b(neuroanesthesia|neurosurgery|intracranial pressure|icp|cerebral"
+        r" perfusion|craniotomy)\b"
+    ),
+    "重症监护与围术期医学 (Critical Care & Perioperative Medicine)": (
+        r"\b(critical care|icu|sepsis|ards|perioperative medicine|postoperative"
+        r" complications)\b"
+    ),
+    "围术期超声/POCUS (Point-of-Care Ultrasound)": (
+        r"\b(pocus|point-of-care ultrasound|focused echocardiography|lung"
+        r" ultrasound|gastric ultrasound)\b"
+    ),
+    "围术期预康复/优化 (Prehabilitation & Optimization)": (
+        r"\b(prehabilitation|preoperative optimization|eras|enhanced recovery"
+        r" after surgery|functional capacity)\b"
+    ),
+    "肌松药与逆转 (Neuromuscular Blockade & Reversal)": (
+        r"\b(neuromuscular blockade|rocuronium|sugammadex|residual"
+        r" neuromuscular blockade|train-of-four|tof)\b"
+    ),
+    "输血与血液管理 (Patient Blood Management)": (
+        r"\b(patient blood management|pbm|transfusion|coagulopathy|tranexamic"
+        r" acid|viscoelastic testing|rotem|teg)\b"
+    ),
+    "麻醉与肿瘤预后 (Anesthesia & Cancer Outcome)": (
+        r"\b(cancer recurrence|metastasis|onco-anesthesia|cancer"
+        r" outcome|immunomodulation)\b"
+    ),
+    "围术期过敏与严重不良反应 (Anaphylaxis & Complications)": (
+        r"\b(anaphylaxis|allergic reaction|malignant hyperthermia|local"
+        r" anesthetic systemic toxicity)\b"
+    ),
+    "术后低氧血症与呼吸功能障碍 (Postoperative Pulmonary Complications)": (
+        r"\b(postoperative pulmonary"
+        r" complications|ppc|hypoxemia|atelectasis|non-invasive ventilation)\b"
+    ),
+    "围术期体温管理/低体温 (Perioperative Hypothermia)": (
+        r"\b(hypothermia|inadvertent hypothermia|patient warming|shivering)\b"
+    ),
+    "术后睡眠与昼夜节律 (Sleep & Circadian Rhythm)": (
+        r"\b(sleep apnea|osa|obstructive sleep apnea|circadian rhythm|sleep"
+        r" quality|melatonin)\b"
+    ),
+    "麻醉作用机制与意识研究 (Mechanism of Anesthesia & Consciousness)": (
+        r"\b(mechanism of anesthesia|general anesthesia"
+        r" mechanism|neural circuits|thalamocortical|consciousness)\b"
+    ),
+    "围术期神经炎症 (Neuroinflammation)": (
+        r"\b(neuroinflammation|microglia|astrocytes|blood-brain"
+        r" barrier|systemic inflammation)\b"
+    ),
+    "肠道菌群与麻醉/围术期 (Gut Microbiota & Anesthesia)": (
+        r"\b(gut microbiota|gut microbiome|gut-brain axis|dysbiosis)\b"
+    ),
+    "麻醉与表观遗传学/转录组学 (Epigenetics & Genomics)": (
+        r"\b(epigenetics|dna methylation|microrna|transcriptomics|single-cell"
+        r" rna)\b"
+    ),
+    "绿色麻醉/环保麻醉 (Sustainable & Green Anesthesia)": (
+        r"\b(green anesthesia|sustainable anesthesia|environmental"
+        r" impact|desflurane|greenhouse gas|carbon footprint)\b"
+    ),
+    "麻醉安全与模拟教学 (Patient Safety & Simulation)": (
+        r"\b(patient safety|simulation training|crisis resource"
+        r" management|medical error|human factors)\b"
+    ),
+}
+
+
+# ==========================================
+# 3. 辅助计算与文本处理逻辑
+# ==========================================
+def extract_clinical_topics(text):
+    text_lower = str(text).lower()
+    return [name for name, pat in CLINICAL_TOPICS.items() if re.search(pat, text_lower)]
+
+
+def extract_hot_drugs(df, top_n=15):
+    cols = ["药物", "涉及文献数", "占比", "总提及次数"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+
+    texts = (
+        df["Title"].fillna("").astype(str) + " " + df["Abstract"].fillna("").astype(str)
+    ).str.lower()
+    doc_freq, mentions = Counter(), Counter()
+    for text in texts:
+        found = [
+            w for w in re.findall(DRUG_PATTERN, text)
+            if len(w) >= 6 and w not in DRUG_EXCLUDE
+        ]
+        doc_freq.update(set(found))
+        mentions.update(found)
+
+    rows = [
+        {
+            "药物": drug.capitalize(),
+            "涉及文献数": n,
+            "占比": f"{n / len(df):.0%}",
+            "总提及次数": mentions[drug],
+        }
+        for drug, n in doc_freq.items()
+    ]
+    rows.sort(key=lambda r: (-r["涉及文献数"], -r["总提及次数"], r["药物"]))
+    return pd.DataFrame(rows[:top_n], columns=cols)
+
+
+def get_past_5_years_range():
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=365 * 5)
+    return start, today
+
+
+def get_past_5_years_date_filter():
+    start, today = get_past_5_years_range()
+    fmt = "%Y/%m/%d"
+    return (
+        f'("{start.strftime(fmt)}"[Date - Publication] : '
+        f'"{today.strftime(fmt)}"[Date - Publication])'
+    )
+
+
+def doc_link(identifier):
+    ident = str(identifier or "").strip()
+    m = re.match(r"PMID\s*:\s*(\d+)", ident, flags=re.IGNORECASE)
+    if m:
+        pmid = m.group(1)
+        return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", f"PMID:{pmid}"
+    if ident.lower().startswith(("http://", "https://")):
+        return ident, ident
+    if ident.isdigit():
+        return f"https://pubmed.ncbi.nlm.nih.gov/{ident}/", f"PMID:{ident}"
+    return None, "本地上传文件（无在线链接）"
+
+
+def _md_escape(text):
+    text = re.sub(r"\s+", " ", str(text or "")).strip() or "（无标题）"
+    return re.sub(r"([\\`*_{}\[\]<>|])", r"\\\1", text)
+
+
+def build_literature_markdown(df):
+    lines = []
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        url, shown = doc_link(row.get("PMID/URL"))
+        title = _md_escape(row.get("Title"))
+        year = str(row.get("Year") or "N/A")
+        head = f"[{title}]({url})" if url else title
+        link_part = f"[{shown}]({url})" if url else shown
+        source = str(row.get("Source") or "").strip()
+        src_part = f" ｜ 来源：{source}" if source else ""
+        lines.append(f"{i}. **{head}**  \n   年份：{year}{src_part} ｜ 链接：{link_part}")
+    return "\n\n".join(lines)
+
+
+def clean_search_keyword(raw_text):
+    if not raw_text:
+        return "Anesthesia"
+    
+    if len(raw_text) > 50 or "\n" in raw_text:
+        kw_match = re.search(r"keywords\s*[:：]\s*([^\n]+)", raw_text, re.IGNORECASE)
+        if kw_match:
+            raw_text = kw_match.group(1)
+        else:
+            clean_snippet = re.sub(r"[^a-zA-Z\s]", " ", raw_text[:300])
+            words = [w for w in clean_snippet.split() if len(w) > 3 and w.lower() not in {"the", "and", "for", "with", "from", "this", "that"}]
+            if words:
+                return " ".join(words[:5])
+
+    text = re.sub(r"\.(pdf|docx|txt|csv)$", "", raw_text, flags=re.IGNORECASE)
+    text = re.sub(r"[_—–-]", " ", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    words = [w for w in text.split() if len(w) > 2]
+    return " ".join(words[:5]) if words else "Anesthesia"
+
+
+def english_part(topic):
+    m = re.search(r"\(([^()]*)\)\s*$", topic)
+    return m.group(1) if m else topic
+
+
+def _decode_bytes(raw):
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def parse_uploaded_files(uploaded_files):
+    data = []
+    for idx, file in enumerate(uploaded_files, 1):
+        filename = file.name
+        ext = filename.rsplit(".", 1)[-1].lower()
+        raw = file.getvalue()
+        abstract = ""
+
+        try:
+            if ext == "pdf":
+                import pypdf
+
+                reader = pypdf.PdfReader(io.BytesIO(raw))
+                abstract = "".join(p.extract_text() or "" for p in reader.pages)[:4000]
+            elif ext == "docx":
+                import docx
+
+                doc = docx.Document(io.BytesIO(raw))
+                abstract = "\n".join(p.text for p in doc.paragraphs)[:4000]
+            elif ext == "txt":
+                abstract = _decode_bytes(raw)[:4000]
+            elif ext == "csv":
+                df_up = pd.read_csv(io.StringIO(_decode_bytes(raw)))
+                for i, (_, row) in enumerate(df_up.iterrows(), 1):
+                    data.append({
+                        "PMID/URL": str(row.get("PMID", f"LOCAL_{idx}_{i}")),
+                        "Title": str(row.get("Title", row.get("title", "未命名文献"))),
+                        "Abstract": str(row.get("Abstract", row.get("abstract", ""))),
+                        "Year": str(row.get("Year", row.get("year", "N/A"))),
+                        "Source": "上传文件",
+                    })
+                continue
+
+            lines = [l.strip() for l in abstract.splitlines() if l.strip()]
+            doc_title = filename
+            if lines and len(lines[0]) > 10 and not lines[0].startswith("PMID"):
+                doc_title = lines[0]
+
+            data.append({
+                "PMID/URL": f"LOCAL_{idx}",
+                "Title": doc_title,
+                "Abstract": abstract or "未能解析出有效正文",
+                "Year": "本地文件",
+                "Source": "上传文件",
+            })
+        except Exception as e:
+            st.error(f"解析文件 {filename} 失败: {e}")
+
+    return pd.DataFrame(data, columns=DOC_COLUMNS)
+
+
+# ==========================================
+# 4. 检索引擎：Tavily 全网 + PubMed
+# ==========================================
+def tavily_request(api_key, query, max_results):
+    import requests
+
+    start, today = get_past_5_years_range()
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "query": (
+                f"{query} anesthesia perioperative trial review "
+                f"recent research {start.year}-{today.year}"
+            ),
+            "search_depth": "advanced",
+            "max_results": min(int(max_results), TAVILY_MAX_RESULTS),
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {resp.status_code}: {resp.text[:200]} "
+            f"（实际发送的 Key：长度 {len(api_key)}，末4位 `{api_key[-4:]}`）"
+        )
+    return resp.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_tavily(query, api_key, max_results):
+    data = tavily_request(api_key, query, max_results)
+    rows = []
+    for res in data.get("results", []):
+        rows.append({
+            "PMID/URL": res.get("url", "Web Link"),
+            "Title": res.get("title", ""),
+            "Abstract": res.get("content", ""),
+            "Year": "N/A（网页）",
+            "Source": "全网学术搜索 (Tavily)",
+        })
+    return pd.DataFrame(rows, columns=DOC_COLUMNS)
+
+
 def _pubmed_esearch(term, retmax):
     handle = Entrez.esearch(db="pubmed", term=term, retmax=retmax, sort="relevance")
     try:
@@ -39,14 +523,38 @@ def _pubmed_esearch(term, retmax):
     finally:
         handle.close()
 
-def get_past_5_years_date_filter():
-    current_year = datetime.datetime.now().year
-    start_year = current_year - 5
-    return f'("{start_year}"[Date - Publication] : "{current_year}"[Date - Publication])'
+
+def _xml_to_text(xml):
+    xml = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", xml, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", xml)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def fetch_pmc_fulltext(pmcid):
+    """抓取 PMC 开放全文：优先截取 Results 章节起的正文（含硬核数据），否则取正文开头。"""
+    num = re.sub(r"\D", "", str(pmcid))
+    if not num:
+        return ""
+    handle = Entrez.efetch(db="pmc", id=num, retmode="xml")
+    try:
+        raw = handle.read()
+    finally:
+        handle.close()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    m = re.search(r"<body\b.*?</body>", raw, flags=re.S | re.I)
+    if not m:  # 无正文（受限/仅元数据）
+        return ""
+    body = m.group(0)
+    r = re.search(r"<title>\s*Results?(?:\s+and\s+Discussion)?\s*</title>", body, flags=re.I)
+    if r:
+        body = body[r.start():]
+    return _xml_to_text(body)[:PMC_FULLTEXT_CHARS]
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_pubmed(query, max_results):
-    """支持标准摘要抓取及增强版 PMC 开放全文提取的 PubMed 检索函数"""
+    """PubMed 检索：标准摘要保底，并对有 PMCID 的文献自动补充 PMC 开放全文节选。"""
     date_filter = get_past_5_years_date_filter()
     id_list = _pubmed_esearch(f"({query}) AND {date_filter}", max_results)
 
@@ -62,255 +570,431 @@ def search_pubmed(query, max_results):
         handle.close()
 
     rows = []
+    pmc_used = 0
     for article in papers.get("PubmedArticle", []):
         try:
             medline = article["MedlineCitation"]
             art = medline["Article"]
             pmid = str(medline["PMID"])
-            
-            # 1. 提取标准摘要作为基础保底
+
             abs_list = art.get("Abstract", {}).get("AbstractText", [])
             abstract_text = " ".join(str(x) for x in abs_list)
-            
-            # 2. 安全提取 PMCID
+
             pmcid = ""
-            pubmed_data = article.get("PubmedData", {})
-            for id_elem in pubmed_data.get("ArticleIdList", []):
-                if hasattr(id_elem, "attributes") and id_elem.attributes.get("IdType") == "pmc":
+            for id_elem in article.get("PubmedData", {}).get("ArticleIdList", []):
+                attrs = getattr(id_elem, "attributes", {}) or {}
+                if attrs.get("IdType") == "pmc":
                     pmcid = str(id_elem)
                     break
 
-            full_text = abstract_text
+            content = abstract_text
             source_desc = "PubMed (数据库摘要)"
 
-            # 3. 增强版 PMC 开放全文自动抓取
-            if pmcid:
-                pmc_num = pmcid.replace("PMC", "").strip()
+            if pmcid and pmc_used < PMC_FULLTEXT_MAX:
                 try:
-                    pmc_handle = Entrez.efetch(db="pmc", id=pmc_num, retmode="xml")
-                    pmc_data = pmc_handle.read()
-                    pmc_handle.close()
-                    
-                    clean_text = re.sub(r'<[^>]+>', ' ', pmc_data)
-                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-                    
-                    if len(clean_text) > len(abstract_text) + 200:
-                        full_text = clean_text[:8000]  # 截取前 8000 字符详细正文
+                    excerpt = fetch_pmc_fulltext(pmcid)
+                    if len(excerpt) > 200:
+                        content = (abstract_text + "\n\n【PMC 开放全文节选】" + excerpt).strip()
                         source_desc = "PubMed Central (PMC 开放全文)"
+                        pmc_used += 1
+                    if not Entrez.api_key:
+                        time.sleep(0.35)  # 无 API Key 时限速 3 次/秒
                 except Exception:
-                    try:
-                        url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmc_num}&retmode=text"
-                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=10) as response:
-                            web_content = response.read().decode('utf-8', errors='ignore')
-                            if len(web_content) > len(abstract_text) + 200:
-                                full_text = web_content[:8000]
-                                source_desc = "PubMed Central (PMC 开放全文)"
-                    except Exception:
-                        pass
+                    pass  # 全文失败自动退回摘要
 
             pub_date = art.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
             year = str(pub_date.get("Year") or str(pub_date.get("MedlineDate", "N/A"))[:4])
-            
             rows.append({
-                "PMID/URL": f"PMID:{pmid}" + (f" | {pmcid}" if pmcid else ""),
+                "PMID/URL": f"PMID:{pmid}",
                 "Title": str(art.get("ArticleTitle", "")),
-                "Abstract": full_text,
+                "Abstract": content,
                 "Year": year,
                 "Source": source_desc,
             })
         except Exception:
             continue
-            
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
 
-def extract_keywords_from_url(url, client, model):
-    """通过参考链接抓取网页内容，并利用大模型提取精准的 PubMed 英文检索词"""
+
+def extract_keywords_from_url(url, api_key, model):
+    """读取参考链接（PubMed 链接直接走 Entrez），由大模型提取英文检索关键词。
+    返回 (关键词 或 None, 错误信息 或 None)。"""
+    import requests
+
+    page_text = ""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            clean_text = re.sub(r'<[^>]+>', ' ', resp.text)
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()[:4000]
-            
-            prompt = f"""请阅读以下网页/文献页面的内容，提取其最核心的医学研究主题，并将其转化为适合 PubMed 数据库的高效英文检索表达式（包含必要的布尔逻辑词如 AND/OR）。
-要求：
-1. 只输出检索词表达式本身，绝对不要输出任何多余的解释、引号或前缀。
-2. 保持专业、精准。
-
-网页内容片段：
-{clean_text}"""
-
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
+        pm = re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url)
+        if pm:
+            h = Entrez.efetch(db="pubmed", id=pm.group(1), retmode="xml")
+            try:
+                rec = Entrez.read(h)
+            finally:
+                h.close()
+            art = rec["PubmedArticle"][0]["MedlineCitation"]["Article"]
+            abs_list = art.get("Abstract", {}).get("AbstractText", [])
+            page_text = f"{art.get('ArticleTitle', '')} " + " ".join(str(x) for x in abs_list)
+        else:
+            resp = requests.get(
+                url, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
-            extracted_query = response.choices[0].message.content.strip().replace('"', '')
-            return extracted_query
+            if resp.status_code != 200:
+                return None, f"网页返回 HTTP {resp.status_code}"
+            page_text = _xml_to_text(resp.text)
+        page_text = page_text[:4000]
+        if len(page_text) < 30:
+            return None, "未能从该链接读取到有效正文"
+
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+        prompt = (
+            "请阅读以下网页/文献内容，提取其最核心的医学研究主题，"
+            "输出 3-6 个适合 PubMed 与网页检索的英文关键词，用空格分隔。\n"
+            "要求：只输出关键词本身；不要布尔运算符（AND/OR）、括号、引号、标点或任何解释。\n\n"
+            f"内容：\n{page_text}"
+        )
+        text, _, _ = call_openrouter_with_fallback(
+            client, model, [{"role": "user", "content": prompt}], temperature=0.1
+        )
+        line = next((l for l in text.strip().splitlines() if l.strip()), "")
+        line = re.sub(r"[^A-Za-z0-9\s\-]", " ", line)
+        words = line.split()[:6]
+        if not words:
+            return None, "大模型未返回有效关键词"
+        return " ".join(words), None
     except Exception as e:
-        st.error(f"解析链接失败: {e}")
-    return None
+        return None, str(e)
+
+
+def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
+    query = clean_search_keyword(raw_topic)
+    msgs = []
+    if query == "Anesthesia" and raw_topic.strip() and raw_topic.strip() != "Anesthesia":
+        msgs.append(("info", "主题中没有可用的英文关键词，已退回使用通用关键词 `Anesthesia` 检索；建议改用英文主题。"))
+
+    frames = []
+    if tavily_key:
+        try:
+            df = search_tavily(query, tavily_key, max_results)
+            frames.append(df)
+            if df.empty:
+                msgs.append(("info", f"Tavily 未能针对【{query}】检索到结果。"))
+        except Exception as e:
+            msgs.append(("warning", f"Tavily 全网搜索出现异常: {e}"))
+    else:
+        msgs.append(("warning", "Tavily API Key 为空，已跳过全网搜索。"))
+
+    try:
+        frames.append(search_pubmed(query, max_results))
+    except Exception as e:
+        msgs.append(("error", f"PubMed 检索失败: {e}"))
+
+    frames = [f for f in frames if not f.empty]
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=DOC_COLUMNS)
+    return out, msgs
+
+
+# ==========================================
+# 5. AI 综述生成引擎与云端自动存储
+# ==========================================
+def _github_cfg():
+    return (
+        os.getenv("GITHUB_TOKEN", "").strip(),
+        os.getenv("GITHUB_REPO", "").strip(),
+        os.getenv("GITHUB_BRANCH", "main").strip() or "main",
+    )
+
+
+def _github_headers(token, raw=False):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github.v3+json",
+    }
+
+
+def _clean_topic_for_filename(topic):
+    topic_str = str(topic).strip()
+    # 误传布尔检索式时，只取第一个检索词命名
+    if " OR " in topic_str or " AND " in topic_str:
+        first = re.sub(r"[()_]", "", topic_str).split(" OR ")[0].split(" AND ")[0].strip()
+        topic_str = first or "Anesthesia_Review"
+    clean = re.sub(r'[\\/:*?"<>|\s()\[\]{}]+', "_", topic_str).strip("_")
+    if len(clean) > 35:
+        clean = clean[:35] + "_etc"
+    return clean or "Anesthesia_Review"
+
 
 def save_review_to_cloud(topic, content, tag="V1"):
-    """
-    通过 GitHub API 安全将综述保存到远端 reviews/ 目录。
-    强制以文章主题命名，并对特殊符号与文件名长度进行严格截断与清洗。
-    """
-    topic_str = str(topic).strip()
-    
-    # 自动过滤误传的布尔检索表达式
-    if " OR " in topic_str or " AND " in topic_str or "_postinduction" in topic_str:
-        clean_terms = re.sub(r'[\(\)_]', '', topic_str)
-        first_term = clean_terms.split(" OR ")[0].split(" AND ")[0].strip()
-        topic_str = first_term if first_term else "Anesthesia_Review"
-
-    clean_topic = re.sub(r'[\\/:*?"<>|\s\(\)\[\]{}]+', "_", topic_str).strip("_")
-    if len(clean_topic) > 35:
-        clean_topic = clean_topic[:35] + "_etc"
-    if not clean_topic:
-        clean_topic = "Anesthesia_Review"
-
+    """优先通过 GitHub API 写入仓库 reviews/ 目录；未配置或失败则降级为本地 saved_reviews/。
+    结果提示写入 session_state['save_notice']，返回保存路径（失败返回 None）。"""
+    clean_topic = _clean_topic_for_filename(topic)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path_in_repo = f"reviews/{clean_topic}_{tag}_{timestamp}.md"
-    
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    repo = os.getenv("GITHUB_REPO", "").strip()
-    branch = os.getenv("GITHUB_BRANCH", "main").strip()
+    fname = f"{clean_topic}_{tag}_{timestamp}.md"
+    token, repo, branch = _github_cfg()
+    gh_error = ""
 
     if token and repo:
-        url = f"https://api.github.com/repos/{repo}/contents/{file_path_in_repo}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        try:
-            encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-            payload = {
-                "message": f"Auto-save review: {clean_topic} ({tag})",
-                "content": encoded_content,
-                "branch": branch
-            }
-            put_resp = requests.put(url, headers=headers, json=payload, timeout=15)
-            if put_resp.status_code in (200, 201):
-                return file_path_in_repo
-        except Exception:
-            pass
+        import requests
 
-    # 本地降级存储
+        try:
+            resp = requests.put(
+                f"https://api.github.com/repos/{repo}/contents/reviews/{fname}",
+                headers=_github_headers(token),
+                json={
+                    "message": f"Auto-save review: {clean_topic} ({tag})",
+                    "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+                    "branch": branch,
+                },
+                timeout=20,
+            )
+            if resp.status_code in (200, 201):
+                github_list_reviews.clear()
+                st.session_state["save_notice"] = ("success", f"综述已同步至 GitHub 仓库：`reviews/{fname}`")
+                return f"reviews/{fname}"
+            gh_error = f"GitHub 返回 HTTP {resp.status_code}"
+        except Exception as e:
+            gh_error = str(e)
+
     os.makedirs("saved_reviews", exist_ok=True)
-    local_filename = f"saved_reviews/{clean_topic}_{tag}_{timestamp}.md"
+    local_path = f"saved_reviews/{fname}"
     try:
-        with open(local_filename, "w", encoding="utf-8") as f:
+        with open(local_path, "w", encoding="utf-8") as f:
             f.write(content)
-        return local_filename
+        tip = f"（GitHub 同步失败：{gh_error}）" if gh_error else "（未配置 GITHUB_TOKEN / GITHUB_REPO）"
+        st.session_state["save_notice"] = (
+            "warning", f"已保存在服务器本地 `{local_path}` {tip}。注意：云端重启后本地文件可能丢失。"
+        )
+        return local_path
     except Exception:
+        st.session_state["save_notice"] = ("error", "综述保存失败（GitHub 与本地均不可用）。")
         return None
 
-# ==================== 2. 侧边栏配置面板 ====================
-st.sidebar.title("🛠️ 麻醉学文献综述工作台")
 
-# API 配置
-api_key = st.sidebar.text_input("OpenAI / OpenRouter API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-base_url = st.sidebar.text_input("API Base URL (可选)", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-selected_model = st.sidebar.text_input("LLM 模型名称", value="gpt-4o")
+@st.cache_data(ttl=60, show_spinner=False)
+def github_list_reviews(token, repo, branch):
+    import requests
 
-st.sidebar.markdown("---")
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/contents/reviews",
+            headers=_github_headers(token), params={"ref": branch}, timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        return sorted(
+            [f["path"] for f in r.json() if str(f.get("name", "")).endswith(".md")], reverse=True
+        )
+    except Exception:
+        return []
 
-# 初始化 session state 用于默认主题与联动
-if "default_topic" not in st.session_state:
-    st.session_state["default_topic"] = "post-induction hypotension AND elderly"
 
-# 主题输入框
-topic_keywords = st.sidebar.text_input(
-    "请确认或手动修改检索主题", 
-    value=st.session_state["default_topic"]
-)
+@st.cache_data(ttl=300, show_spinner=False)
+def github_read_file(token, repo, branch, path):
+    import requests
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("🔗 **或通过参考链接智能提取**")
+    r = requests.get(
+        f"https://api.github.com/repos/{repo}/contents/{path}",
+        headers=_github_headers(token, raw=True), params={"ref": branch}, timeout=20,
+    )
+    r.raise_for_status()
+    return r.text
 
-ref_url = st.sidebar.text_input(
-    "请输入参考文章/网页链接：", 
-    placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
-    key="input_ref_url"
-)
 
-# 初始化临时客户端以支持侧边栏的链接解析
-temp_client = OpenAI(api_key=api_key or "dummy", base_url=base_url) if api_key else None
-
-if st.sidebar.button("📥 读取链接并提取检索词", use_container_width=True):
-    if ref_url.strip() and temp_client:
-        with st.spinner("正在抓取网页并提取核心检索词..."):
-            new_query = extract_keywords_from_url(ref_url.strip(), temp_client, selected_model)
-            if new_query:
-                st.session_state["default_topic"] = new_query
-                st.success(f"成功提取检索词：{new_query}")
-                st.rerun()
-            else:
-                st.warning("未能从该链接中提取到有效关键词。")
-    else:
-        st.warning("请先配置 API Key 并输入有效的网址链接。")
-
-st.sidebar.markdown("---")
-max_results = st.sidebar.slider("检索文献最大数量", 5, 50, 20)
-enable_glossary = st.sidebar.checkbox("启用专业术语表对齐 (glossary.md)", value=True)
-
-# ==================== 3. 主界面布局与核心交互 ====================
-st.title("🩺 麻醉学与围术期医学前沿文献深度综述系统")
-st.markdown("基于 **PubMed/PMC 开放全文数据库**、**大模型多维归纳** 与 **GitHub 云端持久化** 的智能学术综述生成平台。")
-
-tab1, tab2, tab3 = st.tabs(["🚀 生成综述主面板", "📚 数据库与全网文献明细", "📖 术语表管理"])
-
-with tab1:
-    st.subheader("一键生成 5000 字硬核学术综述")
-    
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        run_btn = st.button("🚀 开始检索并生成深度综述", type="primary", use_container_width=True)
-
-    if run_btn:
-        if not api_key:
-            st.error("请先在左侧侧边栏输入您的 API Key！")
-        else:
-            client = OpenAI(api_key=api_key, base_url=base_url)
-            
-            with st.status("正在进行多源学术检索与全文解析...", expanded=True) as status:
-                st.write("正在连接 PubMed/PMC 数据库进行近 5 年文献深度检索...")
-                df_pubmed = search_pubmed(topic_keywords, max_results)
-                status.update(label=f"成功获取 {len(df_pubmed)} 篇文献（含 PMC 开放全文）", state="running")
-                
-                # 组装背景资料
-                combined_input = ""
-                for idx, row in df_pubmed.iterrows():
-                    combined_input += (
-                        f"文献 [{idx+1}]\n"
-                        f"标题: {row['Title']} ({row['Year']})\n"
-                        f"来源: {row['Source']} | 链接标识: {row['PMID/URL']}\n"
-                        f"详细内容/摘要节选:\n{row['Abstract']}\n\n"
-                    )
-                
-                # 加载术语表
-                glossary_section = ""
-                if enable_glossary:
-                    glossary_text = load_glossary_content()
-                    if glossary_text.strip():
-                        glossary_section = f"""
+def build_glossary_section(enable, follow_up=False):
+    """生成术语表对齐指令（大小写不敏感、强制中文译名）。"""
+    if not enable:
+        return ""
+    glossary_text = load_glossary_content()
+    if not glossary_text.strip():
+        return ""
+    head = "请继续严格参照以下专业术语表 (Glossary)：" if follow_up else (
+        "### 📖 专业术语表 (Glossary) 严格对齐与翻译规范：\n"
+        "请在撰写、总结或翻译专业名词时，**必须严格参照**以下专有名词对照表："
+    )
+    return f"""
 ---
-### 📖 专业术语表 (Glossary) 严格对齐与翻译规范：
-请在撰写综述时**必须严格参照**以下专有名词对照表：
+{head}
 {glossary_text.strip()}
 
 **⚠️ 核心硬性要求**：
-1. **大小写不敏感匹配**：无论背景资料中的英文专业名词是大写、小写还是复数形式，**在中文正文中都必须严格翻译并替换为词典中对应的中文专业译名**。
-2. 绝对不允许在中文正文里直接大段保留未翻译的英文核心病名、药名或生理指标。
+1. **大小写不敏感匹配**：无论背景资料中的英文专业名词是大写、小写还是复数形式，在中文正文中都必须严格替换为词典中对应的中文专业译名。
+2. 不允许在中文正文里直接大段保留未翻译的英文核心病名、药名或生理指标（首次出现可在括号内附英文原词）。
 """
 
-                today = datetime.datetime.now()
-                start = today - datetime.timedelta(days=365*5)
 
-                prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
-请基于我提供的【全网学术搜索与 PubMed/PMC 全文数据库近 5 年检索到的文献】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》，全文约 5000 字。
+def call_openrouter_with_fallback(client, primary_model, messages, temperature=0.3):
+    models_to_try = [primary_model] + [m for m in FALLBACK_FREE_MODELS if m != primary_model]
+    last_error = ""
+
+    for model in models_to_try:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=10000,
+                timeout=180.0,
+            )
+            choices = getattr(response, "choices", None)
+            if not choices or choices[0] is None:
+                last_error = f"模型 `{model}` 返回的 choices 为空"
+                continue
+
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None) if message else None
+            if content and str(content).strip():
+                return str(content), model, getattr(choices[0], "finish_reason", None)
+            last_error = f"模型 `{model}` 返回生成文本为空"
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status in (401, 403):
+                key = str(getattr(client, "api_key", "") or "")
+                raise RuntimeError(
+                    f"OpenRouter 拒绝了这个 API Key（HTTP {status}：{e}）。"
+                    f"实际发送的 Key：长度 {len(key)}，前缀 `{key[:9]}`，末4位 `{key[-4:]}`。"
+                    "请到 openrouter.ai/keys 重新生成 Key，完整复制后更新 Secrets 并 Reboot app。"
+                )
+            last_error = f"模型 `{model}` 报错: {e}"
+            time.sleep(1.5)
+
+    raise RuntimeError(f"所有备选模型均未能正常生成响应。最后报错细节: {last_error}")
+
+
+def parse_openrouter_models(payload):
+    models = []
+    for m in payload.get("data", []):
+        mid = m.get("id")
+        if not mid:
+            continue
+        outs = (m.get("architecture") or {}).get("output_modalities")
+        if outs and "text" not in outs:
+            continue
+        pricing = m.get("pricing") or {}
+        try:
+            free = mid.endswith(":free") or (
+                float(pricing.get("prompt", 1)) == 0 and float(pricing.get("completion", 1)) == 0
+            )
+        except (TypeError, ValueError):
+            free = mid.endswith(":free")
+        ctx = m.get("context_length") or 0
+        label = f"{mid}  ·  {ctx // 1000}k" if ctx else mid
+        models.append({"id": mid, "label": label, "free": free, "ctx": ctx})
+    return models
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_openrouter_models():
+    import requests
+
+    try:
+        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=15)
+        resp.raise_for_status()
+        return parse_openrouter_models(resp.json())
+    except Exception:
+        return []
+
+
+MAX_CONTINUATIONS = 4
+
+
+def strip_citation_marks(text):
+    if not text:
+        return text
+    # 先把“本地文献3 / 全网文献2-4”之类改写为自然语言，避免被后续规则删成残句
+    text = re.sub(
+        r"(?:本地文献|全网/PubMed\s*文献|全网文献|PubMed\s*文献)\s*\d+(?:\s*[-–—~,，、和与及]\s*\d+)*",
+        "相关研究",
+        text,
+    )
+    pats = [
+        r"[【\[（(]?\s*(?:来源|文献|Refs?\.?|References?|Sources?)\s*\d+(?:\s*[-–—~,，、;；和与及]\s*\d+)*\s*(?:等|etc\.?)?\s*[）)\]】]",
+        r"[【\[（(]\s*(?:来源\s*)?\d+(?:\s*[-–—~,，、;；和与及]\s*\d+)*\s*等?\s*[）)\]】]",
+        r"[\[［【]\s*\d+(?:\s*[-–—~,，、;；]\s*\d+)*\s*[\]］】]",
+        r"[（(]\s*PMID\s*[:：]?\s*\d+(?:\s*[,，;；、]\s*(?:PMID\s*[:：]?\s*)?\d+)*\s*[）)]",
+        r"[（(]\s*https?://[^\s)）]+\s*[）)]",
+        r",?\s*PMID\s*[:：]?\s*\d{5,9}",
+        r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+",
+        r"\^\s*\[?\d+(?:\s*[,，-]\s*\d+)*\]?",
+    ]
+    for p in pats:
+        text = re.sub(p, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]+([,，。；：、;）)])", r"\1", text)
+    text = re.sub(r"[（(]\s*[）)]", "", text)
+    return text
+
+
+def call_with_continuation(client, primary_model, messages, temperature=0.3):
+    text, used_model, finish = call_openrouter_with_fallback(
+        client, primary_model, messages, temperature
+    )
+    for _ in range(MAX_CONTINUATIONS):
+        if finish != "length":
+            break
+        cont_messages = list(messages) + [
+            {"role": "assistant", "content": text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一段输出因长度上限被中断。请紧接上文最后一个字继续写完剩余全部内容："
+                    "不要重复已输出的内容，不要任何开场白或解释；若上文中断在表格中，"
+                    "请从该表格的下一行继续；务必完整写完所有未完成的章节（含总结与展望）。"
+                ),
+            },
+        ]
+        more, used_model, finish = call_openrouter_with_fallback(
+            client, used_model, cont_messages, temperature
+        )
+        text += more
+    return strip_citation_marks(text), used_model, finish
+
+
+def _excerpt_for_prompt(row):
+    """PMC 全文给更长的节选额度，其余只给摘要额度。"""
+    limit = PROMPT_CHARS_FULLTEXT if "PMC" in str(row.get("Source", "")) else PROMPT_CHARS_ABSTRACT
+    return str(row.get("Abstract", ""))[:limit]
+
+
+def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df, enable_glossary=True):
+    try:
+        clean_key = str(api_key).strip()
+        if not clean_key:
+            return "❌ 错误：请填入有效的 OpenRouter API Key！", None, None
+
+        client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
+
+        local_text = ""
+        if not local_df.empty:
+            local_text += "\n=== [本地文献资料] ===\n"
+            for _, row in local_df.head(20).iterrows():
+                local_text += (
+                    f"文献标题: {row.get('Title', '')}\n"
+                    f"摘要/内容: {str(row.get('Abstract', ''))[:PROMPT_CHARS_ABSTRACT]}...\n\n"
+                )
+
+        web_text = ""
+        if not web_df.empty:
+            web_text += "\n=== [全网及PubMed/PMC文献资料] ===\n"
+            for _, row in web_df.head(30).iterrows():
+                web_text += (
+                    f"文献标题: {row.get('Title', '')} ({row.get('Year', '')})\n"
+                    f"资料类型: {row.get('Source', '')}\n"
+                    f"摘要/全文节选: {_excerpt_for_prompt(row)}\n\n"
+                )
+
+        combined_input = local_text + web_text
+
+        hot_drugs = extract_hot_drugs(
+            pd.concat([local_df, web_df], ignore_index=True), top_n=10
+        )
+        if not hot_drugs.empty:
+            combined_input += "\n=== [自动统计：当前文献集中被讨论最多的药物] ===\n"
+            for _, r in hot_drugs.iterrows():
+                combined_input += f"- {r['药物']}：涉及 {r['涉及文献数']} 篇文献\n"
+        start, today = get_past_5_years_range()
+
+        glossary_section = build_glossary_section(enable_glossary)
+
+        prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
+请基于我提供的【用户上传文献】以及【全网学术搜索与 PubMed/PMC 数据库近 5 年检索到的文献（部分含 PMC 开放全文）】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
 
 背景资料如下：
 {combined_input}
@@ -323,16 +1007,17 @@ with tab1:
 * **必须使用中文**撰写约 300 字的精炼摘要，涵盖研究背景、核心进展、核心争论及未来方向；关键词需提供中英文对照。
 
 #### 二、 主题背景与近五年研究演进 (Introduction)
-* 梳理该领域近 5 年（{start.year}-{today.year}年）的发展轨迹与演变逻辑。
+* 梳理该领域（【{topic_keywords}】）近 5 年（{start.year}-{today.year}年）的发展轨迹与演变逻辑。
 
 #### 三、 近五年核心学术突破与重大研究进展 (Major Breakthroughs)
-* **【硬核数据强制要求】**：必须深入引用背景资料中具体临床试验或前瞻性研究的**硬核量化数据**。例如，必须明确写出：
-  1. **具体样本量**（如“某项纳入了 $N=420$ 例患者的随机对照试验显示……”）；
-  2. **具体的生理/药理量化指标**（如“观察组指标较基线显著改变，数值达 $22.5 \pm 4.3$……”）；
-  3. **具体的给药方案与终点数据**。绝对不能只写笼统的结论。
+* **【硬核数据强制要求】**：必须深入引用背景资料中具体临床试验或前瞻性研究的**量化数据**，例如：
+  1. **具体样本量**（如“一项纳入 420 例患者的随机对照试验显示……”）；
+  2. **具体的生理/药理量化指标**（如均数±标准差、OR/RR/HR 及 95%CI、P 值）；
+  3. **具体的给药方案与终点数据**。
+  资料中确无具体数值时，请如实说明“原文未提供具体数值”，**严禁编造数据**，不能只写笼统结论。
 
 #### 四、 当前热点领域的核心争论与未解决的临床困境 (Key Controversies)
-* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点，必须直接引用不同研究在具体终点指标上的**数据冲突与对立结果**。
+* **重点章节**：深入剖析当前学术界存在的重大争论与分歧点（疗效争议、安全隐患、矛盾结论等），并直接对比不同研究在具体终点指标上的**数据冲突与对立结果**。
 
 #### 五、 机制探讨与方法学瓶颈 (Mechanistic Insights)
 * 讨论当前基础与临床研究面临的方法学瓶颈。
@@ -340,6 +1025,7 @@ with tab1:
 #### 六、 临床转化与围术期管理落地建议 (Clinical Implications)
 * **必须包含一份完整 Markdown 表格**：
 | 环节 | 建议措施 | 证据等级与推荐强度 |
+（请填入具体的术前评估、麻醉诱导、血流动力学、肌松监测、镇痛策略等表格行）
 
 #### 七、 总结与展望 (Conclusion)
 * 总结全篇，提出未来 3-5 年最值得投入的科研切入点。
@@ -347,62 +1033,486 @@ with tab1:
 ---
 
 ### ⚠️ 输出格式极其严格的约束（切记）：
-1. **全文（包括第一章摘要与关键词）必须完全使用中文撰写与翻译**，专业名词可在括号中附带英文原词。
-2. 必须完整输出完所有的 7 个章节，特别是表格与总结部分，绝对不能中途截断！
+1. **全文（包括第一章摘要与关键词）必须完全使用中文撰写**，专业名词可在括号中附英文原词。
+2. 必须完整输出完所有的 7 个章节，**特别是“六、临床转化表格”和“七、总结与展望”必须完整撰写完，绝对不能中途截断**！
 3. 请使用标准 Markdown 格式，语言专业严谨。
-4. **绝对禁止在正文中出现任何形式的文献序号、标号或标记**：包括但不限于 `[1]`、`[1,2]`、`(来源2、3等)`、上标数字、或者任何形式的“文献1”、“本地文献”、“全网文献”、“PMID”等引用标识。
-5. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID。
+4. **绝对禁止在正文中出现任何形式的文献序号、标号或标记**：包括但不限于 `[1]`、`[1,2]`、`(来源2、3等)`、上标数字、或者任何形式的“文献1”、“本地文献”、“全网文献”、“PMID”等引用标识。正文表述文献时，必须完全采用无序号的自然语言学术叙述。
+5. 论述必须以上方【背景资料】中的文献为依据，严禁编造文献、作者、数据或 PMID；资料不足之处请明确说明。
 """
 
-                st.write("正在交由大模型进行深度综合归纳与硬核数据萃取...")
-                response = client.chat.completions.create(
-                    model=selected_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    stream=True
-                )
-                
-                review_placeholder = st.empty()
-                full_review_content = ""
-                for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        full_review_content += chunk.choices[0].delta.content
-                        review_placeholder.markdown(full_review_content + "▌")
-                
-                review_placeholder.markdown(full_review_content)
-                status.update(label="综述生成完毕！正在自动同步至 GitHub 远端...", state="complete")
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号。",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
-            # 自动云端持久化（以文章主题命名，防止文件名过长）
-            saved_path = save_review_to_cloud(topic=topic_keywords, content=full_review_content, tag="V1")
-            if saved_path:
-                st.success(f"🎉 综述已成功加密同步至云端仓库路径: `{saved_path}`")
+        result, used_model, finish = call_with_continuation(
+            client, model_name, messages, temperature=0.3
+        )
+        wrapped = wrap_article(result, used_model, finish)
+        save_review_to_cloud(topic_keywords, wrapped, tag="V1")
+        return wrapped, result, messages
+    except Exception as e:
+        return f"❌ 深度综述生成失败: {e}", None, None
+
+
+def wrap_article(result, used_model, finish):
+    note = ""
+    if finish == "length":
+        note = "\n\n> ⚠️ *输出经多次自动续写后仍未写完，可在下方提交“继续补全未完成章节”，或更换模型。*"
+    return (
+        f"> 💡 *本篇深度综述由 AI 模型 `{used_model}` 基于全网文献生成，"
+        f"内容须经专业人员核实后方可使用*\n\n" + result + note
+    )
+
+
+REVISE_MODE = "✏️ 修改综述（输出完整新版本）"
+ASK_MODE = "💬 提问讨论（不改动文章）"
+
+
+def follow_up_review(api_key, model_name, base_messages, current_article,
+                     qa_history, user_text, mode, enable_glossary=True):
+    clean_key = str(api_key).strip()
+    if not clean_key:
+        raise RuntimeError("请填入有效的 OpenRouter API Key！")
+    client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
+
+    glossary_directive = build_glossary_section(enable_glossary, follow_up=True)
+
+    if mode == REVISE_MODE:
+        directive = (
+            f"请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
+            f"(保持 7 个章节结构与 Markdown 表格，不得省略、缩写或中途截断；"
+            f"只能依据背景资料中的文献，严禁编造；**正文中严禁出现任何形式的参考文献序号、标号、(来源...) 或 PMID**；直接输出文章，不要额外解释)。"
+            f"{glossary_directive}\n\n"
+            f"修改意见：{user_text}"
+        )
+        temperature = 0.3
+    else:
+        directive = (
+            f"请基于上述综述与背景资料回答下面的问题，简明准确，不要重写全文；"
+            f"只能依据背景资料中的文献，严禁编造，资料不足请直说；回答中不要出现文献编号或 PMID。"
+            f"{glossary_directive}\n\n"
+            f"问题：{user_text}"
+        )
+        temperature = 0.4
+
+    messages = (
+        list(base_messages)
+        + [{"role": "assistant", "content": current_article}]
+        + list(qa_history[-6:])
+        + [{"role": "user", "content": directive}]
+    )
+    return call_with_continuation(client, model_name, messages, temperature=temperature)
+
+
+# ==========================================
+# 6. Streamlit 主界面与交互
+# ==========================================
+MODE_1 = "1. 上传本地文献 + 全网 (Tavily/PubMed) 综合分析"
+MODE_2 = "2. 直接输入主题全网搜查并撰写综述"
+NO_PRESET = "-- 手动/自定义输入主题 --"
+
+ss = st.session_state
+ss.setdefault("web_df", pd.DataFrame(columns=DOC_COLUMNS))
+ss.setdefault("searched_topic", "")
+ss.setdefault("search_msgs", [])
+ss.setdefault("article_topic", "")
+ss.setdefault("versions", [])
+ss.setdefault("base_messages", [])
+ss.setdefault("current_raw", "")
+ss.setdefault("qa_history", [])
+ss.setdefault("custom_topic_input", "")
+ss.setdefault("manual_topic_input", "")
+
+
+def _sync_preset():
+    p = st.session_state.get("preset_select", NO_PRESET)
+    st.session_state["manual_topic_input"] = "" if p == NO_PRESET else english_part(p)
+
+st.title("💉 麻醉学全网文献热点追踪与深度综述生成系统")
+st.markdown(
+    "支持**上传本地文献** + **Tavily 全网学术搜索** + **PubMed 数据库**，"
+    "一键撰写包含**核心争论、临床建议表格与未来方向**的学术综述。"
+)
+
+render_auth_header()
+
+st.sidebar.header("⚙️ 配置面板")
+work_mode = st.sidebar.radio("选择工作模式：", options=[MODE_1, MODE_2], index=0)
+
+st.sidebar.markdown("---")
+
+st.sidebar.header("🔑 API 凭证配置（自动加载）")
+_AC = {"autocomplete": "off"} if "autocomplete" in inspect.signature(st.text_input).parameters else {}
+
+# 修改 OpenRouter 输入框，加上 key="or_key_input"
+openrouter_input = st.sidebar.text_input(
+    "API Key (OpenRouter / DeepSeek)",
+    value="", 
+    type="password", 
+    key="or_key_input",  # <--- 加上这一行，打破 Streamlit 状态缓存
+    **_AC,
+    placeholder="已在后台配置，留空即使用" if ENV_OPENROUTER_KEY else "请输入",
+)
+_typed_or = normalize_key(openrouter_input)
+openrouter_api_key = _typed_or or ENV_OPENROUTER_KEY
+
+# 修改 Tavily 输入框，加上 key="tavily_key_input"
+tavily_input = st.sidebar.text_input(
+    "Tavily 全网搜索 API Key",
+    value="", 
+    type="password", 
+    key="tavily_key_input",  # <--- 加上这一行
+    **_AC,
+    placeholder="已在后台配置，留空即使用" if ENV_TAVILY_KEY else "请输入",
+)
+_typed_tavily = normalize_key(tavily_input)
+tavily_api_key = _typed_tavily or ENV_TAVILY_KEY
+
+MODEL_CUSTOM = "✏️ 自定义模型 ID…"
+live_models = fetch_openrouter_models()
+
+free_models = [m for m in live_models if m["free"]]
+if free_models:
+    pool = free_models
+    labels = {m["id"]: m["label"] for m in pool}
+    live_ids = {m["id"] for m in free_models}
+    ordered = [m for m in [DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS if m in labels]
+    ordered = list(dict.fromkeys(ordered)) + sorted(i for i in labels if i not in ordered)
+    _alive = [m for m in FALLBACK_FREE_MODELS if m in live_ids or m == "openrouter/free"]
+    if len(_alive) > 1:
+        FALLBACK_FREE_MODELS = _alive
+else:
+    labels = {m: m for m in FALLBACK_FREE_MODELS}
+    ordered = list(dict.fromkeys([DEFAULT_OPENROUTER_MODEL] + FALLBACK_FREE_MODELS))
+
+options = ordered + [MODEL_CUSTOM]
+default_idx = options.index(DEFAULT_OPENROUTER_MODEL) if DEFAULT_OPENROUTER_MODEL in options else 0
+choice = st.sidebar.selectbox(
+    "选择大模型",
+    options=options,
+    index=default_idx,
+    format_func=lambda x: x if x == MODEL_CUSTOM else labels.get(x, x),
+)
+if choice == MODEL_CUSTOM:
+    openrouter_model = st.sidebar.text_input(
+        "自定义模型 ID", value=DEFAULT_OPENROUTER_MODEL,
+    ).strip() or DEFAULT_OPENROUTER_MODEL
+else:
+    openrouter_model = choice
+
+st.sidebar.markdown("---")
+
+enable_glossary_checkbox = st.sidebar.checkbox("启用麻醉学专业术语动态对齐", value=True)
+
+max_doc_count = st.sidebar.slider(
+    "检索文献数量限制",
+    min_value=10, max_value=100, value=50, step=10,
+)
+
+st.sidebar.markdown("---")
+
+# ---- 参考链接智能提取检索词（须在主题输入框之前执行，才能写入其 session_state）----
+st.sidebar.markdown("🔗 **或通过参考链接智能提取检索词**")
+ref_url = st.sidebar.text_input(
+    "参考文章/网页链接：",
+    key="ref_url_input",
+    placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
+)
+if st.sidebar.button("📥 读取链接并提取检索词"):
+    if not ref_url.strip():
+        ss["url_msg"] = ("warning", "请先输入有效的网址链接。")
+    elif not openrouter_api_key:
+        ss["url_msg"] = ("warning", "请先配置 OpenRouter API Key（用于提取关键词）。")
+    else:
+        with st.spinner("正在读取链接并提取核心检索词..."):
+            _q, _err = extract_keywords_from_url(ref_url.strip(), openrouter_api_key, openrouter_model)
+        if _q:
+            ss["custom_topic_input" if work_mode == MODE_1 else "manual_topic_input"] = _q
+            ss["url_msg"] = ("success", f"已提取检索词并填入主题框：{_q}")
+            st.rerun()
+        else:
+            ss["url_msg"] = ("warning", f"未能提取检索词：{_err}")
+_url_msg = ss.pop("url_msg", None)
+if _url_msg:
+    getattr(st.sidebar, _url_msg[0])(_url_msg[1])
+
+st.sidebar.markdown("---")
+
+local_df = pd.DataFrame(columns=DOC_COLUMNS)
+search_topic = ""
+
+if work_mode == MODE_1:
+    uploaded_files = st.sidebar.file_uploader(
+        "上传本地文献（支持 PDF, Docx, TXT, CSV）：",
+        type=["pdf", "docx", "txt", "csv"],
+        accept_multiple_files=True,
+    )
+    custom_topic = st.sidebar.text_input(
+        "补充或指定搜索的主题关键词（可选）：",
+        key="custom_topic_input", placeholder="例如：Dexmedetomidine neuroprotection",
+    )
+    if uploaded_files:
+        local_df = parse_uploaded_files(uploaded_files)
+        st.sidebar.success(f"已解析 {len(local_df)} 条本地文献记录！")
+
+    if custom_topic.strip():
+        search_topic = custom_topic.strip()
+    elif not local_df.empty:
+        combined_content = " ".join(local_df["Abstract"].tolist() + local_df["Title"].tolist())
+        search_topic = clean_search_keyword(combined_content)
+else:
+    selected_preset = st.sidebar.selectbox(
+        "💡 从 33 项权威热点词库中选择：",
+        options=[NO_PRESET] + list(CLINICAL_TOPICS.keys()),
+        key="preset_select", on_change=_sync_preset,
+    )
+    manual_input = st.sidebar.text_input(
+        "✏️ 请确认或手动修改检索主题（建议使用英文）：",
+        key="manual_topic_input", placeholder="例如：Remimazolam vs Propofol sedation",
+    )
+    search_topic = manual_input.strip()
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔍 开始检索文献", type="primary", disabled=not search_topic):
+    with st.spinner(f"正在全网（Tavily + PubMed）检索与【{search_topic}】相关的近 5 年文献..."):
+        ss["web_df"], ss["search_msgs"] = fetch_web_and_pubmed_literature(
+            search_topic, tavily_api_key, max_doc_count
+        )
+        ss["searched_topic"] = search_topic
+if not search_topic:
+    st.sidebar.caption("👆 请先输入或选择一个主题（模式 1 也可直接上传文件）。")
+
+web_df = ss["web_df"]
+review_topic = ss["searched_topic"] or search_topic
+
+st.markdown("### 📊 当前数据准备状态")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("解析本地文献数", f"{len(local_df)} 篇")
+c2.metric("全网/PubMed 关联文献", f"{len(web_df)} 篇")
+_pmc_n = int(web_df["Source"].astype(str).str.contains("PMC").sum()) if not web_df.empty else 0
+c3.metric("其中含 PMC 开放全文", f"{_pmc_n} 篇")
+c4.metric("拟撰写综述主题", review_topic or "未指定")
+
+for level, text in ss["search_msgs"]:
+    getattr(st, level)(text)
+
+st.markdown("---")
+
+all_docs = pd.concat([local_df, web_df], ignore_index=True)
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📝 深度知识更新文章", "📚 数据库与全网文献明细", "🔥 课题热点图表", "📖 术语表管理"]
+)
+
+with tab1:
+    st.subheader("📝 AI 深度撰写：知识更新综述")
+    st.caption(
+        "系统将融合本地文献与全网学术搜索（Tavily）以及 PubMed 数据库近 5 年的研究，"
+        "探讨学术争论并输出临床转化表格。生成后会自动保存在服务器云端。"
+    )
+
+    _gh_token, _gh_repo, _gh_branch = _github_cfg()
+    history = []  # (显示名, 类型, 路径)
+    if _gh_token and _gh_repo:
+        history += [(f"☁️ GitHub · {os.path.basename(p)}", "gh", p)
+                    for p in github_list_reviews(_gh_token, _gh_repo, _gh_branch)]
+    if os.path.exists("saved_reviews"):
+        history += [(f"💾 本地 · {f}", "local", os.path.join("saved_reviews", f))
+                    for f in sorted(os.listdir("saved_reviews"), reverse=True) if f.endswith(".md")]
+    if history:
+        with st.expander("📁 查看已自动保存的历史综述文件"):
+            _pick = st.selectbox("选择历史文件：", range(len(history)), format_func=lambda i: history[i][0])
+            _label, _kind, _path = history[_pick]
+            try:
+                if _kind == "gh":
+                    cloud_content = github_read_file(_gh_token, _gh_repo, _gh_branch, _path)
+                else:
+                    with open(_path, "r", encoding="utf-8") as cf:
+                        cloud_content = cf.read()
+                st.markdown(cloud_content[:1000] + "\n\n*(预览前 1000 字符)*")
+                st.download_button(
+                    label=f"📥 下载此文件 ({os.path.basename(_path)})",
+                    data=cloud_content,
+                    file_name=os.path.basename(_path),
+                    mime="text/markdown",
+                    key="dl_history",
+                )
+            except Exception as e:
+                st.error(f"读取失败: {e}")
+
+    if st.button("🚀 撰写深度综述", type="primary"):
+        if not review_topic:
+            st.error("请先在左侧边栏输入或选择一个具体的综述主题！")
+        elif not openrouter_api_key:
+            st.error("请在侧边栏填入有效的 OpenRouter API Key！")
+        elif local_df.empty and web_df.empty:
+            st.warning("当前没有文献数据，请先点击“开始检索文献”或上传文件！")
+        else:
+            with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
+                display_text, raw_text, base_msgs = generate_5000_words_review(
+                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df, enable_glossary_checkbox
+                )
+            if raw_text is None:
+                st.error(display_text)
             else:
-                st.warning("⚠️ 云端同步失败，已保存在本地 `saved_reviews/` 目录中。")
+                ss["versions"] = [{"label": "V1 初稿", "text": display_text}]
+                ss["base_messages"] = base_msgs
+                ss["current_raw"] = raw_text
+                ss["qa_history"] = []
+                ss["article_topic"] = review_topic
+
+    if ss["versions"]:
+        st.markdown("---")
+        _notice = ss.get("save_notice")
+        if _notice:
+            getattr(st, _notice[0])(_notice[1])
+        versions = ss["versions"]
+        if len(versions) > 1:
+            idx = st.selectbox(
+                "查看版本：", options=range(len(versions)),
+                index=len(versions) - 1,
+                format_func=lambda i: versions[i]["label"],
+            )
+        else:
+            idx = 0
+        shown = versions[idx]
+        st.markdown(shown["text"])
+
+        safe_name = re.sub(r'[\\/:*?"<>|]', "_", ss["article_topic"])
+        ver_tag = shown["label"].split()[0]
+        st.download_button(
+            label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
+            data=shown["text"],
+            file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
+            mime="text/markdown",
+        )
+
+        st.markdown("---")
+        st.subheader("💬 继续提问 / 提交修改意见")
+        st.caption("“修改”模式会基于最新版生成完整新版本并保留历史版本；“提问”模式只回答问题，不改动文章。")
+
+        for msg in ss["qa_history"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        with st.form("followup_form", clear_on_submit=True):
+            mode = st.radio("本次操作：", [REVISE_MODE, ASK_MODE], horizontal=True)
+            user_text = st.text_area(
+                "请输入内容：", height=120,
+                placeholder="修改示例：把第四章的争论部分扩写，并增加关于老年患者的讨论；"
+                            "提问示例：第六章表格中的肌松监测建议依据是什么？",
+            )
+            submitted = st.form_submit_button("提交", type="primary")
+
+        if submitted:
+            if not user_text.strip():
+                st.warning("请输入修改意见或问题。")
+            elif not openrouter_api_key:
+                st.error("请在侧边栏填入有效的 OpenRouter API Key！")
+            else:
+                spinner_txt = "AI 正在修订全文，请稍候..." if mode == REVISE_MODE else "AI 正在思考..."
+                try:
+                    with st.spinner(spinner_txt):
+                        reply, used_model, finish = follow_up_review(
+                            openrouter_api_key, openrouter_model, ss["base_messages"],
+                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode, enable_glossary_checkbox,
+                        )
+                    if mode == REVISE_MODE:
+                        n = len(ss["versions"]) + 1
+                        short = re.sub(r"\s+", " ", user_text.strip())[:12]
+                        new_text = wrap_article(reply, used_model, finish)
+                        ss["versions"].append({
+                            "label": f"V{n} {short}",
+                            "text": new_text,
+                        })
+                        ss["current_raw"] = reply
+                        ss["qa_history"].append({"role": "user", "content": f"✏️ 修改：{user_text.strip()}"})
+                        ss["qa_history"].append({"role": "assistant", "content": f"已按要求生成第 {n} 版全文（见上方“查看版本”）。"})
+                        save_review_to_cloud(ss["article_topic"], new_text, tag=f"V{n}")
+                    else:
+                        ss["qa_history"].append({"role": "user", "content": f"💬 提问：{user_text.strip()}"})
+                        ss["qa_history"].append({"role": "assistant", "content": reply})
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 处理失败: {e}")
 
 with tab2:
-    st.subheader("📚 数据库检索结果与全文状态明细")
-    st.markdown("在此可核查当前检索到的文献来源（是 PMC 开放全文还是标准数据库摘要）。")
-    if st.button("🔄 刷新文献列表"):
-        st.rerun()
-    
-    # 快速预览检索结果
-    preview_df = search_pubmed(topic_keywords, max_results)
-    if not preview_df.empty:
-        st.dataframe(preview_df, use_container_width=True)
+    st.subheader("已调用的文献数据明细")
+    if not all_docs.empty:
+        lit_md = build_literature_markdown(all_docs)
+        st.caption(f"共 {len(all_docs)} 篇（点击标题或链接可直接访问）")
+        st.markdown(lit_md)
+        st.download_button(
+            label="📥 下载文献清单 (.md)",
+            data=f"# 文献清单：{review_topic or '未指定主题'}\n\n{lit_md}\n",
+            file_name="文献清单.md",
+            mime="text/markdown",
+        )
     else:
-        st.info("当前暂无检索结果，请在主面板点击生成或调整检索主题。")
+        st.info("暂无文献数据。")
 
 with tab3:
+    st.subheader("当前文献集的 33 项热点映射分类")
+    if not all_docs.empty:
+        texts = all_docs["Title"].fillna("").astype(str) + " " + all_docs["Abstract"].fillna("").astype(str)
+        topics_list = []
+        for text in texts:
+            topics_list.extend(extract_clinical_topics(text))
+
+        if topics_list:
+            df_counts = pd.DataFrame(Counter(topics_list).most_common(), columns=["热点主题", "匹配频次"])
+            fig = px.bar(
+                df_counts, x="匹配频次", y="热点主题", orientation="h",
+                color="匹配频次", color_continuous_scale="Reds",
+            )
+            fig.update_layout(
+                yaxis=dict(autorange="reversed"),
+                height=max(400, len(df_counts) * 25),
+            )
+            st.plotly_chart(fig, **STRETCH)
+        else:
+            st.info("未发现匹配的预设热点。")
+
+        st.markdown("---")
+        st.subheader("💊 当前文献集中讨论最热门的药物（自动提取）")
+        st.caption(
+            "依据药物国际通用名（INN）词干规则，从标题与摘要中自动识别药物，"
+            "统计被多少篇文献提及。未写死具体药名，结果随检索主题和文献集自动变化。"
+        )
+        hot_df = extract_hot_drugs(all_docs, top_n=15)
+        if not hot_df.empty:
+            fig2 = px.bar(
+                hot_df, x="涉及文献数", y="药物", orientation="h",
+                color="涉及文献数", color_continuous_scale="Blues",
+            )
+            fig2.update_layout(
+                yaxis=dict(autorange="reversed"),
+                height=max(350, len(hot_df) * 30),
+            )
+            st.plotly_chart(fig2, **STRETCH)
+            st.dataframe(hot_df, hide_index=True, **STRETCH)
+        else:
+            st.info("当前文献集中未识别到药物名称（网页片段较短时可能出现，可增大检索数量）。")
+    else:
+        st.info("暂无文献数据。")
+
+with tab4:
     st.subheader("📖 专业术语表 (glossary.md) 管理")
-    st.markdown("在此维护双语医学专业词汇，确保大模型生成的中文综述专业词汇翻译一致。")
-    
+    st.markdown("在此维护中英对照的医学专业词汇，保证大模型生成的中文综述译名一致。每行一条，如：`hypotension - 低血压`。")
+    if ss.pop("_glossary_saved", False):
+        st.success("术语表保存成功！")
     current_glossary = load_glossary_content()
-    edited_glossary = st.text_area("编辑 glosssary.md 内容", value=current_glossary, height=300)
-    
+    edited_glossary = st.text_area("编辑 glossary.md 内容", value=current_glossary, height=300)
     if st.button("💾 保存术语表"):
         try:
             with open("glossary.md", "w", encoding="utf-8") as f:
                 f.write(edited_glossary)
-            st.success("术语表保存成功！")
+            ss["_glossary_saved"] = True
+            st.rerun()
         except Exception as e:
             st.error(f"保存失败: {e}")
+    st.caption("提示：Streamlit Cloud 的本地文件在应用重启后可能丢失，长期使用请把 glossary.md 同步到代码仓库。")
