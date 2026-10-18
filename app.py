@@ -1202,15 +1202,27 @@ REVISE_MODE = "✏️ 修改综述（输出完整新版本）"
 ASK_MODE = "💬 提问讨论（不改动文章）"
 
 
+NEED_SEARCH_RE = re.compile(r"NEED_SEARCH\s*[:：]\s*([^\n]*)", re.IGNORECASE)
+ASK_SEARCH_MAX = 8  # 提问时补充检索 PubMed 的文献数
+
+
 def follow_up_review(api_key, model_name, base_messages, current_article,
-                     qa_history, user_text, mode, enable_glossary=True):
+                     qa_history, user_text, mode, enable_glossary=True, topic=""):
+    """返回 (回复文本, 实际模型, finish_reason, 补充检索信息或None)。
+    提问模式：先判断背景资料是否足以回答；不足则自动检索 PubMed，基于新检索到的文献回答。"""
     clean_key = str(api_key).strip()
     if not clean_key:
         raise RuntimeError("请填入有效的 OpenRouter API Key！")
     client = OpenAI(api_key=clean_key, base_url="https://openrouter.ai/api/v1")
 
     glossary_directive = build_glossary_section(enable_glossary, follow_up=True)
+    context = (
+        list(base_messages)
+        + [{"role": "assistant", "content": current_article}]
+        + list(qa_history[-6:])
+    )
 
+    # ---------- 修改模式 ----------
     if mode == REVISE_MODE:
         directive = (
             f"请根据下面的修改意见修订上述综述，**输出修订后的完整全文**"
@@ -1219,23 +1231,74 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
             f"{glossary_directive}\n\n"
             f"修改意见：{user_text}"
         )
-        temperature = 0.3
-    else:
-        directive = (
-            f"请基于上述综述与背景资料回答下面的问题，简明准确，不要重写全文；"
-            f"只能依据背景资料中的文献，严禁编造，资料不足请直说；回答中不要出现文献编号或 PMID。"
-            f"{glossary_directive}\n\n"
-            f"问题：{user_text}"
+        text, used, finish = call_with_continuation(
+            client, model_name, context + [{"role": "user", "content": directive}], temperature=0.3
         )
-        temperature = 0.4
+        return text, used, finish, None
 
-    messages = (
-        list(base_messages)
-        + [{"role": "assistant", "content": current_article}]
-        + list(qa_history[-6:])
-        + [{"role": "user", "content": directive}]
+    # ---------- 提问模式：先看背景资料够不够 ----------
+    judge_directive = (
+        "请先判断：上述【背景资料】与综述中的文献，是否足以回答下面的问题。\n"
+        "- 如果足以：请基于背景资料简明准确地回答，不要重写全文；只能依据背景资料中的文献，严禁编造；回答中不要出现文献编号或 PMID。\n"
+        "- 如果背景资料没有涉及该问题所需的证据（或只有无关内容）：**不要回答、不要凭空编造**，"
+        "只输出一行：NEED_SEARCH: 用于 PubMed 检索的英文关键词（3-6 个单词，空格分隔，不含 AND/OR、括号、引号）。\n"
+        f"{glossary_directive}\n\n问题：{user_text}"
     )
-    return call_with_continuation(client, model_name, messages, temperature=temperature)
+    text, used, finish = call_with_continuation(
+        client, model_name, context + [{"role": "user", "content": judge_directive}], temperature=0.4
+    )
+    m = NEED_SEARCH_RE.search(text)
+    if not m:
+        return text, used, finish, None
+
+    # ---------- 背景资料不足 → 检索 PubMed ----------
+    kw = re.sub(r"[^A-Za-z0-9\s\-]", " ", m.group(1))
+    query = " ".join(kw.split()[:6]) or clean_search_keyword(topic)
+    try:
+        df = search_pubmed(query, ASK_SEARCH_MAX)
+    except Exception as e:
+        return (
+            f"背景资料中没有涉及该问题的证据，补充检索 PubMed（关键词：`{query}`）时出错：{e}",
+            used, finish, {"query": query, "df": pd.DataFrame(columns=DOC_COLUMNS)},
+        )
+    if df.empty:
+        return (
+            f"背景资料中没有涉及该问题的证据，且在 PubMed 近 5 年文献中用关键词 `{query}` 也未检索到相关文献，"
+            "暂时无法给出有依据的回答。可以换一种问法，或上传相关文献后再试。",
+            used, finish, {"query": query, "df": df},
+        )
+
+    extra_text = "\n=== [针对本问题补充检索到的 PubMed/PMC 文献] ===\n"
+    for _, row in df.iterrows():
+        extra_text += (
+            f"文献标题: {row.get('Title', '')} ({row.get('Year', '')})\n"
+            f"资料类型: {row.get('Source', '')}\n"
+            f"摘要/全文节选: {_excerpt_for_prompt(row)}\n\n"
+        )
+    search_directive = (
+        "原背景资料中没有涉及下面这个问题，系统已补充检索 PubMed，结果如下：\n"
+        f"{extra_text}\n"
+        "请**仅依据这些补充文献**简明准确地回答问题（不要重写全文）；\n"
+        "1. 回答开头请用一句话说明：原综述资料未涉及该问题，以下回答基于补充检索的 PubMed 文献；\n"
+        "2. 若补充文献仍不足以回答，请直接说明证据不足，严禁编造文献、作者或数据；\n"
+        "3. 有具体样本量或数值时请如实引用；正文中不要出现文献编号、[1] 或 PMID。"
+        f"{glossary_directive}\n\n问题：{user_text}"
+    )
+    answer, used2, finish2 = call_with_continuation(
+        client, used, context + [{"role": "user", "content": search_directive}], temperature=0.4
+    )
+
+    refs = []
+    for _, row in df.iterrows():
+        url, shown = doc_link(row.get("PMID/URL"))
+        title = _md_escape(row.get("Title"))
+        year = str(row.get("Year") or "N/A")
+        refs.append(f"- [{title}]({url}) （{year}）" if url else f"- {title} （{year}）")
+    answer += (
+        f"\n\n---\n🔎 *背景资料未涉及该问题，已补充检索 PubMed（关键词：`{query}`），"
+        f"本回答参考了以下 {len(df)} 篇文献：*\n\n" + "\n".join(refs)
+    )
+    return answer, used2, finish2, {"query": query, "df": df}
 
 
 # ==========================================
@@ -1254,6 +1317,7 @@ ss.setdefault("versions", [])
 ss.setdefault("base_messages", [])
 ss.setdefault("current_raw", "")
 ss.setdefault("qa_history", [])
+ss.setdefault("extra_df", pd.DataFrame(columns=DOC_COLUMNS))
 ss.setdefault("custom_topic_input", "")
 ss.setdefault("manual_topic_input", "")
 
@@ -1438,7 +1502,8 @@ for level, text in ss["search_msgs"]:
 
 st.markdown("---")
 
-all_docs = pd.concat([local_df, web_df], ignore_index=True)
+all_docs = pd.concat([local_df, web_df, ss["extra_df"]], ignore_index=True)
+all_docs = all_docs.drop_duplicates(subset=["PMID/URL"], keep="first").reset_index(drop=True)
 
 tab1, tab2 = st.tabs(
     ["📝 深度知识更新文章", "📚 数据库与全网文献明细"]
@@ -1499,6 +1564,7 @@ with tab1:
                 ss["base_messages"] = base_msgs
                 ss["current_raw"] = raw_text
                 ss["qa_history"] = []
+                ss["extra_df"] = pd.DataFrame(columns=DOC_COLUMNS)
                 ss["article_topic"] = review_topic
 
     if ss["versions"]:
@@ -1529,7 +1595,7 @@ with tab1:
 
         st.markdown("---")
         st.subheader("💬 继续提问 / 提交修改意见")
-        st.caption("“修改”模式会基于最新版生成完整新版本并保留历史版本；“提问”模式只回答问题，不改动文章。")
+        st.caption("“修改”模式会基于最新版生成完整新版本并保留历史版本；“提问”模式只回答问题、不改动文章：优先依据已有文献作答，若背景资料没有相关内容，会自动检索 PubMed 后再回答，并列出所参考的文献。")
 
         for msg in ss["qa_history"]:
             with st.chat_message(msg["role"]):
@@ -1550,13 +1616,21 @@ with tab1:
             elif not openrouter_api_key:
                 st.error("请在侧边栏填入有效的 OpenRouter API Key！")
             else:
-                spinner_txt = "AI 正在修订全文，请稍候..." if mode == REVISE_MODE else "AI 正在思考..."
+                spinner_txt = (
+                    "AI 正在修订全文，请稍候..." if mode == REVISE_MODE
+                    else "AI 正在思考（若背景资料不足，将自动检索 PubMed 后再回答）..."
+                )
                 try:
                     with st.spinner(spinner_txt):
-                        reply, used_model, finish = follow_up_review(
+                        reply, used_model, finish, searched = follow_up_review(
                             openrouter_api_key, openrouter_model, ss["base_messages"],
-                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode, enable_glossary_checkbox,
+                            ss["current_raw"], ss["qa_history"], user_text.strip(), mode,
+                            enable_glossary_checkbox, ss["article_topic"],
                         )
+                    if searched and not searched["df"].empty:  # 补充检索到的文献并入明细
+                        _new = searched["df"].copy()
+                        _new["Source"] = _new["Source"].astype(str) + " · 提问补充检索"
+                        ss["extra_df"] = pd.concat([ss["extra_df"], _new], ignore_index=True)
                     if mode == REVISE_MODE:
                         n = len(ss["versions"]) + 1
                         short = re.sub(r"\s+", " ", user_text.strip())[:12]
