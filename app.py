@@ -616,6 +616,31 @@ def search_pubmed(query, max_results):
     return pd.DataFrame(rows, columns=DOC_COLUMNS)
 
 
+SLUG_STOPWORDS = {
+    "science", "article", "articles", "pii", "abs", "abstract", "doi", "full", "pdf", "html",
+    "www", "content", "view", "journal", "journals", "index", "php", "pubmed", "fulltext",
+    "http", "https", "com", "org", "the", "and", "for", "with",
+}
+BAD_LLM_OUTPUT = re.compile(
+    r"no output|none\b|n/a|cannot|can't|unable|sorry|not (?:enough|provide)|insufficient|as an ai",
+    re.IGNORECASE,
+)
+
+
+def sanitize_url(url):
+    """清洗用户粘贴的链接：去空白；若被粘进已有文字中间（出现多个 http），取最后一个；
+    ScienceDirect 链接按 PII 还原为标准地址。"""
+    u = str(url or "").strip()
+    starts = [m.start() for m in re.finditer(r"https?://", u)]
+    if len(starts) > 1:
+        u = u[starts[-1]:]
+    u = re.split(r"\s", u)[0]
+    pii = re.search(r"sciencedirect\.com/science/article/(?:abs/)?pii/([A-Z0-9]{16,17})", u)
+    if pii:
+        u = f"https://www.sciencedirect.com/science/article/pii/{pii.group(1)}"
+    return u
+
+
 def fetch_page_text(url, tavily_key=""):
     """多级回退读取链接内容：PubMed/PMC(Entrez) → DOI(Crossref) → 直接抓取(完整浏览器头)
     → Tavily Extract → 仅用链接地址中的单词推测。返回 (文本, 提示信息)。"""
@@ -671,6 +696,26 @@ def fetch_page_text(url, tavily_key=""):
         except Exception:
             pass
 
+    # 3b. ScienceDirect 的 PII → Crossref alternative-id（避开 403）
+    pii = re.search(r"/pii/([A-Z0-9]{16,17})", url)
+    if pii:
+        try:
+            r = requests.get(
+                "https://api.crossref.org/works",
+                params={"filter": f"alternative-id:{pii.group(1)}", "rows": 1},
+                timeout=15,
+                headers={"User-Agent": "anesthesia-review-app (mailto:anesthesia_agent@example.com)"},
+            )
+            if r.status_code == 200:
+                items = r.json().get("message", {}).get("items", [])
+                if items:
+                    title = " ".join(items[0].get("title", []))
+                    abstract = _xml_to_text(items[0].get("abstract", ""))
+                    if title:
+                        return f"{title} {abstract}", None
+        except Exception:
+            pass
+
     # 4. 直接抓取（完整浏览器请求头）
     status = None
     try:
@@ -709,9 +754,10 @@ def fetch_page_text(url, tavily_key=""):
 
     # 6. 最后手段：用链接路径里的英文单词推测主题
     slug = unquote(urlparse(url).path)
-    words = [w for w in re.split(r"[^A-Za-z]+", slug) if len(w) > 2]
-    if len(words) >= 3:
-        return " ".join(words), f"网页无法访问（{status}），已仅根据链接地址中的单词推测主题，结果仅供参考"
+    words = [w for w in re.split(r"[^A-Za-z]+", slug)
+             if len(w) > 3 and w.lower() not in SLUG_STOPWORDS]
+    if len(words) >= 2:
+        return " ".join(words), f"【推测】网页无法访问（{status}），已仅根据链接地址中的单词推测主题，结果仅供参考"
 
     return "", f"网页无法访问（{status}）。请直接复制文章标题/摘要里的英文关键词填入主题框，或改用 PubMed / DOI 链接"
 
@@ -719,7 +765,12 @@ def fetch_page_text(url, tavily_key=""):
 def extract_keywords_from_url(url, api_key, model, tavily_key=""):
     """读取参考链接并由大模型提取英文检索关键词。返回 (关键词或None, 提示或错误信息)。"""
     try:
+        url = sanitize_url(url)
         page_text, note = fetch_page_text(url, tavily_key)
+        if len(page_text.strip()) < 3:
+            return None, note or "未能从该链接读取到有效内容"
+        if note and note.startswith("【推测】"):  # 仅有链接单词，不交给大模型，避免它输出 No output
+            return " ".join(page_text.split()[:6]), note.replace("【推测】", "")
         if len(page_text.strip()) < 15:
             return None, note or "未能从该链接读取到有效内容"
 
@@ -734,6 +785,8 @@ def extract_keywords_from_url(url, api_key, model, tavily_key=""):
             client, model, [{"role": "user", "content": prompt}], temperature=0.1
         )
         line = next((l for l in text.strip().splitlines() if l.strip()), "")
+        if BAD_LLM_OUTPUT.search(line):
+            return None, f"大模型未能提取出有效关键词（返回：{line[:40]}），请手动填写主题"
         line = re.sub(r"[^A-Za-z0-9\s\-]", " ", line)
         words = line.split()[:6]
         if not words:
@@ -1299,6 +1352,7 @@ ref_url = st.sidebar.text_input(
     "参考文章/网页链接：",
     key="ref_url_input",
     placeholder="https://pubmed.ncbi.nlm.nih.gov/40322031/",
+    help="粘贴前请先清空输入框（Ctrl+A 全选后再粘贴），避免链接被插进旧文字中间。",
 )
 if st.sidebar.button("📥 读取链接并提取检索词"):
     if not ref_url.strip():
@@ -1306,9 +1360,12 @@ if st.sidebar.button("📥 读取链接并提取检索词"):
     elif not openrouter_api_key:
         ss["url_msg"] = ("warning", "请先配置 OpenRouter API Key（用于提取关键词）。")
     else:
+        _clean_url = sanitize_url(ref_url)
+        if _clean_url != ref_url.strip():
+            st.sidebar.info(f"已自动清洗链接：{_clean_url}")
         with st.spinner("正在读取链接并提取核心检索词..."):
             _q, _err = extract_keywords_from_url(
-                ref_url.strip(), openrouter_api_key, openrouter_model, tavily_api_key
+                _clean_url, openrouter_api_key, openrouter_model, tavily_api_key
             )
         if _q:
             ss["custom_topic_input" if work_mode == MODE_1 else "manual_topic_input"] = _q
