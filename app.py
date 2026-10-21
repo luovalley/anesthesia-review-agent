@@ -1311,7 +1311,6 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             client, model_name, messages, temperature=0.3
         )
         wrapped = wrap_article(result, used_model, finish)
-        save_review_to_cloud(topic_keywords, wrapped, tag="V1")
         return wrapped, result, messages
     except Exception as e:
         return f"❌ 深度综述生成失败: {e}", None, None
@@ -1667,7 +1666,7 @@ with tab1:
     st.subheader("📝 AI 深度撰写：知识更新综述")
     st.caption(
         "系统将融合本地文献与全网学术搜索（Tavily）以及 PubMed 数据库近 5 年的研究，"
-        "探讨学术争论并输出临床转化表格。生成后会自动保存在服务器云端。"
+        "探讨学术争论并输出临床转化表格。生成后不会自动保存，请在文章下方点击“保存到 GitHub”按钮手动保存。"
     )
 
     _gh_token, _gh_repo, _gh_branch = _github_cfg()
@@ -1730,9 +1729,6 @@ with tab1:
 
     if ss["versions"]:
         st.markdown("---")
-        _notice = ss.get("save_notice")
-        if _notice:
-            getattr(st, _notice[0])(_notice[1])
         versions = ss["versions"]
         if len(versions) > 1:
             idx = st.selectbox(
@@ -1747,12 +1743,23 @@ with tab1:
 
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", ss["article_topic"])
         ver_tag = shown["label"].split()[0]
-        st.download_button(
-            label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
-            data=shown["text"],
-            file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
-            mime="text/markdown",
-        )
+        dl_col, save_col = st.columns(2)
+        with dl_col:
+            st.download_button(
+                label=f"📥 下载当前查看版本 ({ver_tag}) (.md)",
+                data=shown["text"],
+                file_name=f"{safe_name}_全网深度知识更新综述_{ver_tag}.md",
+                mime="text/markdown",
+            )
+        with save_col:
+            if st.button(f"☁️ 保存当前版本 ({ver_tag}) 到 GitHub", key="btn_manual_save"):
+                with st.spinner("正在保存..."):
+                    save_review_to_cloud(ss["article_topic"], shown["text"], tag=ver_tag)
+        _notice = ss.pop("save_notice", None)  # 只显示一次
+        if _notice:
+            getattr(st, _notice[0])(_notice[1])
+        if not (_github_cfg()[0] and _github_cfg()[1]):
+            st.caption("提示：未配置 GITHUB_TOKEN / GITHUB_REPO，点击保存将只存到服务器本地（重启后可能丢失）。")
 
         st.markdown("---")
         st.subheader("💬 继续提问 / 提交修改意见")
@@ -1803,7 +1810,6 @@ with tab1:
                         ss["current_raw"] = reply
                         ss["qa_history"].append({"role": "user", "content": f"✏️ 修改：{user_text.strip()}"})
                         ss["qa_history"].append({"role": "assistant", "content": f"已按要求生成第 {n} 版全文（见上方“查看版本”）。"})
-                        save_review_to_cloud(ss["article_topic"], new_text, tag=f"V{n}")
                     else:
                         ss["qa_history"].append({"role": "user", "content": f"💬 提问：{user_text.strip()}"})
                         ss["qa_history"].append({"role": "assistant", "content": reply})
