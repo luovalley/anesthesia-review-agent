@@ -1,9 +1,11 @@
 import base64
 import datetime
+import hashlib
 import hmac
 import html
 import inspect
 import io
+import json
 import os
 import re
 import time
@@ -70,6 +72,7 @@ PMC_FULLTEXT_MAX = 8          # 每次检索最多抓取多少篇 PMC 全文（�
 PMC_FULLTEXT_CHARS = 5000     # 每篇全文节选字符数
 PROMPT_CHARS_ABSTRACT = 1500  # 送入大模型的单篇摘要上限
 PROMPT_CHARS_FULLTEXT = 4500  # 送入大模型的单篇 PMC 全文节选上限
+PROMPT_CHARS_LOCAL = 3000     # 用户上传文件是主题依据，给更长的节选额度
 
 try:
     _ver = tuple(int(x) for x in st.__version__.split(".")[:2])
@@ -404,7 +407,7 @@ def clean_search_keyword(raw_text):
     text = re.sub(r"[_—–-]", " ", text)
     text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
     words = [w for w in text.split() if len(w) > 2]
-    return " ".join(words[:5]) if words else "Anesthesia"
+    return " ".join(words[:8]) if words else "Anesthesia"
 
 
 def english_part(topic):
@@ -472,6 +475,107 @@ def parse_uploaded_files(uploaded_files):
     return pd.DataFrame(data, columns=DOC_COLUMNS)
 
 
+HEADER_STOPWORDS = {
+    "journal", "available", "elsevier", "sciencedirect", "copyright", "article", "articles", "study",
+    "patients", "patient", "results", "result", "methods", "method", "conclusion", "conclusions",
+    "background", "objective", "objectives", "introduction", "discussion", "abstract", "keywords",
+    "received", "accepted", "published", "online", "corresponding", "author", "authors", "university",
+    "department", "hospital", "https", "email", "contents", "lists", "homepage", "volume", "issue",
+    "with", "that", "this", "from", "were", "have", "been", "which", "their", "than", "after", "between",
+    "using", "used", "also", "these", "other", "into", "such", "more", "most", "within", "among",
+    "clinical", "review", "trial", "analysis", "group", "groups", "data", "research", "based", "associated",
+}
+
+
+def heuristic_topic_from_files(local_df):
+    """无 API Key 或大模型失败时的兜底：优先取文件自带 Keywords 行，否则取高频有效词。"""
+    texts = [f"{r['Title']}\n{str(r['Abstract'])[:3000]}" for _, r in local_df.iterrows()]
+    joined = "\n".join(texts)
+    m = re.search(r"keywords?\s*[:：]\s*([^\n]+)", joined, flags=re.IGNORECASE)
+    if m:
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z\-]{2,}", m.group(1))
+                 if w.lower() not in HEADER_STOPWORDS]
+        if len(words) >= 2:
+            return {"query": " ".join(words[:6]), "topic_zh": "", "synonyms": []}
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\-]{3,}", joined)
+             if w.lower() not in HEADER_STOPWORDS]
+    top = [w for w, _ in Counter(words).most_common(5)]
+    return {"query": " ".join(top) if top else "", "topic_zh": "", "synonyms": []}
+
+
+def derive_topic_from_files(local_df, api_key, model):
+    """让大模型阅读上传文件，识别其核心研究主题；返回 {query, topic_zh, synonyms}。"""
+    fallback = heuristic_topic_from_files(local_df)
+    if not api_key:
+        return fallback
+    try:
+        parts, total = [], 0
+        for _, r in local_df.head(5).iterrows():
+            seg = f"【{r['Title']}】\n{str(r['Abstract'])[:1800]}"
+            parts.append(seg)
+            total += len(seg)
+            if total > 7000:
+                break
+        prompt = (
+            "你是医学文献检索专家。下面是用户上传的文献内容（可能有多篇）。请判断它们共同的核心研究主题，"
+            "并只输出一个 JSON 对象（不要代码块、不要解释），格式：\n"
+            '{"topic_zh": "中文主题名（不超过25字）", '
+            '"query": "3-6个英文检索关键词，空格分隔", '
+            '"synonyms": ["核心概念的英文同义词或缩写，最多5个"]}\n'
+            "要求：\n"
+            "1. 只依据文献实际内容，query 必须是文献的核心疾病/药物/技术/人群等具体概念，"
+            "不得泛化成 anesthesia、surgery、patients 这类宽泛词；\n"
+            "2. query 不含 AND/OR、括号、引号；\n"
+            "3. 忽略期刊页眉页脚、作者单位、版权声明等无关内容。\n\n"
+            + "\n\n".join(parts)
+        )
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+        text, _, _ = call_openrouter_with_fallback(
+            client, model, [{"role": "user", "content": prompt}], temperature=0.1
+        )
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        data = json.loads(m.group(0))
+        q = re.sub(r"[^A-Za-z0-9\s\-]", " ", str(data.get("query", "")))
+        q = " ".join(q.split()[:6])
+        if not q or BAD_LLM_OUTPUT.search(q):
+            return fallback
+        syn = [str(s).strip() for s in data.get("synonyms", []) if str(s).strip()][:5]
+        return {"query": q, "topic_zh": str(data.get("topic_zh", "")).strip()[:40], "synonyms": syn}
+    except Exception:
+        return fallback
+
+
+RELEVANCE_GENERIC = {"anesthesia", "anaesthesia", "anesthetic", "perioperative", "surgery", "surgical",
+                     "study", "review", "clinical", "patients", "trial", "effect", "effects"}
+
+
+def filter_relevant(df, query, synonyms=None, min_keep=3):
+    """按检索词在标题+摘要中的命中数过滤跑题文献；返回 (过滤后的 df, 被剔除篇数)。"""
+    if df.empty:
+        return df, 0
+    words = [w for w in re.findall(r"[a-z0-9]+", str(query).lower())
+             if len(w) >= 3 and w not in RELEVANCE_GENERIC]
+    stems = list(dict.fromkeys(w[:6] for w in words))
+    if not stems:
+        return df, 0
+    syn = [s.lower() for s in (synonyms or []) if s]
+    need = max(1, -(-len(stems) // 2))  # 至少命中一半检索词
+
+    scores = []
+    for _, row in df.iterrows():
+        text = f"{row.get('Title', '')} {row.get('Abstract', '')}".lower()
+        sc = sum(1 for s in stems if s in text)
+        if any(sy in text for sy in syn):
+            sc += 1
+        scores.append(sc)
+    scored = df.assign(_score=scores)
+    kept = scored[scored["_score"] >= need]
+    if len(kept) < min_keep:  # 过滤过严时，保留得分最高的几篇，避免结果为空
+        kept = scored[scored["_score"] > 0].sort_values("_score", ascending=False).head(max(min_keep, 5))
+    kept = kept.sort_values("_score", ascending=False, kind="stable")
+    return kept.drop(columns="_score").reset_index(drop=True), len(df) - len(kept)
+
+
 # ==========================================
 # 4. 检索引擎：Tavily 全网 + PubMed
 # ==========================================
@@ -484,8 +588,7 @@ def tavily_request(api_key, query, max_results):
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "query": (
-                f"{query} anesthesia perioperative trial review "
-                f"recent research {start.year}-{today.year}"
+                f"{query} clinical study review {start.year}-{today.year}"
             ),
             "search_depth": "advanced",
             "max_results": min(int(max_results), TAVILY_MAX_RESULTS),
@@ -557,8 +660,13 @@ def search_pubmed(query, max_results):
     date_filter = get_past_5_years_date_filter()
     id_list = _pubmed_esearch(f"({query}) AND {date_filter}", max_results)
 
-    if not id_list and len(query.split()) > 1:
-        id_list = _pubmed_esearch(f"({query.split()[0]}) AND {date_filter}", max_results)
+    words = query.split()
+    k = len(words) - 1
+    while not id_list and k >= 2:  # 逐步去掉末尾次要词，保持主题不被泛化
+        id_list = _pubmed_esearch(f"({' '.join(words[:k])}) AND {date_filter}", max_results)
+        k -= 1
+    if not id_list and len(words) > 1:
+        id_list = _pubmed_esearch(f"({words[0]}) AND {date_filter}", max_results)
     if not id_list:
         return pd.DataFrame(columns=DOC_COLUMNS)
 
@@ -795,7 +903,7 @@ def extract_keywords_from_url(url, api_key, model, tavily_key=""):
         return None, str(e)
 
 
-def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
+def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results, synonyms=None):
     query = clean_search_keyword(raw_topic)
     msgs = []
     if query == "Anesthesia" and raw_topic.strip() and raw_topic.strip() != "Anesthesia":
@@ -820,6 +928,9 @@ def fetch_web_and_pubmed_literature(raw_topic, tavily_key, max_results):
 
     frames = [f for f in frames if not f.empty]
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=DOC_COLUMNS)
+    out, dropped = filter_relevant(out, query, synonyms)
+    if dropped:
+        msgs.append(("info", f"已自动过滤 {dropped} 篇与主题【{query}】相关性较低的检索结果，其余按相关度排序。"))
     return out, msgs
 
 
@@ -1083,7 +1194,8 @@ def _excerpt_for_prompt(row):
     return str(row.get("Abstract", ""))[:limit]
 
 
-def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df, enable_glossary=True):
+def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, web_df,
+                               enable_glossary=True, topic_desc=""):
     try:
         clean_key = str(api_key).strip()
         if not clean_key:
@@ -1097,7 +1209,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
             for _, row in local_df.head(20).iterrows():
                 local_text += (
                     f"文献标题: {row.get('Title', '')}\n"
-                    f"摘要/内容: {str(row.get('Abstract', ''))[:PROMPT_CHARS_ABSTRACT]}...\n\n"
+                    f"摘要/内容: {str(row.get('Abstract', ''))[:PROMPT_CHARS_LOCAL]}...\n\n"
                 )
 
         web_text = ""
@@ -1123,11 +1235,28 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
 
         glossary_section = build_glossary_section(enable_glossary)
 
+        desc = f"（{topic_desc}）" if topic_desc else ""
+        if not local_df.empty:
+            topic_anchor = f"""
+### 🎯 主题一致性硬性约束（最高优先级）：
+1. 本综述的唯一主题是【{topic_keywords}】{desc}，该主题由用户上传的文件内容确定。
+2. 背景资料中的【本地文献资料】是主题的权威依据，必须作为综述的核心骨架；【全网及PubMed/PMC文献资料】只用于补充与该主题直接相关的新证据。
+3. 凡与该主题不直接相关的文献、药物或疾病（即便出现在背景资料中），一律忽略，不得展开论述，更不得把综述写成其他主题。
+4. 若检索到的文献整体偏离上传文件的主题，请只依据上传文件撰写，并在文中说明补充证据有限。
+"""
+        else:
+            topic_anchor = f"""
+### 🎯 主题一致性硬性约束（最高优先级）：
+1. 本综述的唯一主题是【{topic_keywords}】。
+2. 凡与该主题不直接相关的文献、药物或疾病，一律忽略，不得展开论述。
+"""
+
         prompt = f"""你是一名世界顶尖的麻醉学与围术期医学教授、权威学术期刊资深主编。
 请基于我提供的【用户上传文献】以及【全网学术搜索与 PubMed/PMC 数据库近 5 年检索到的文献（部分含 PMC 开放全文）】，围绕主题 **【{topic_keywords}】**，撰写一篇高度专业、结构严谨的**《麻醉学与围术期医学前沿知识更新与重难点热点深度综述》**，全文约 5000 字。
 
 背景资料如下：
 {combined_input}
+{topic_anchor}
 {glossary_section}
 ---
 
@@ -1173,7 +1302,7 @@ def generate_5000_words_review(api_key, model_name, topic_keywords, local_df, we
         messages = [
             {
                 "role": "system",
-                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号。",
+                "content": "你是一名精通麻醉学前沿研究的权威期刊主编。你的输出必须完整，绝不中途截断段落或表格，且正文中绝不出现任何参考文献序号或编号。你必须始终紧扣用户指定的主题，忽略与主题无关的资料。",
             },
             {"role": "user", "content": prompt},
         ]
@@ -1241,7 +1370,8 @@ def follow_up_review(api_key, model_name, base_messages, current_article,
         "请先判断：上述【背景资料】与综述中的文献，是否足以回答下面的问题。\n"
         "- 如果足以：请基于背景资料简明准确地回答，不要重写全文；只能依据背景资料中的文献，严禁编造；回答中不要出现文献编号或 PMID。\n"
         "- 如果背景资料没有涉及该问题所需的证据（或只有无关内容）：**不要回答、不要凭空编造**，"
-        "只输出一行：NEED_SEARCH: 用于 PubMed 检索的英文关键词（3-6 个单词，空格分隔，不含 AND/OR、括号、引号）。\n"
+        "只输出一行：NEED_SEARCH: 用于 PubMed 检索的英文关键词（3-6 个单词，空格分隔，不含 AND/OR、括号、引号）。"
+        f"关键词必须同时包含本综述主题【{topic}】的核心词，以保证检索结果不偏离主题。\n"
         f"{glossary_directive}\n\n问题：{user_text}"
     )
     text, used, finish = call_with_continuation(
@@ -1311,6 +1441,7 @@ NO_PRESET = "-- 手动/自定义输入主题 --"
 ss = st.session_state
 ss.setdefault("web_df", pd.DataFrame(columns=DOC_COLUMNS))
 ss.setdefault("searched_topic", "")
+ss.setdefault("searched_desc", "")
 ss.setdefault("search_msgs", [])
 ss.setdefault("article_topic", "")
 ss.setdefault("versions", [])
@@ -1444,6 +1575,7 @@ st.sidebar.markdown("---")
 
 local_df = pd.DataFrame(columns=DOC_COLUMNS)
 search_topic = ""
+active_profile = None  # 仅当主题来自上传文件识别时使用（含中文主题名与同义词）
 
 if work_mode == MODE_1:
     uploaded_files = st.sidebar.file_uploader(
@@ -1459,11 +1591,31 @@ if work_mode == MODE_1:
         local_df = parse_uploaded_files(uploaded_files)
         st.sidebar.success(f"已解析 {len(local_df)} 条本地文献记录！")
 
+    file_topic_query = ""
+    if not local_df.empty:
+        _sig = hashlib.md5(
+            "||".join((local_df["Title"].astype(str) + local_df["Abstract"].astype(str).str[:300]).tolist()).encode("utf-8")
+        ).hexdigest()
+        if ss.get("file_topic_sig") != _sig:  # 文件变化时重新识别主题
+            with st.spinner("正在识别上传文件的核心主题..."):
+                _prof = derive_topic_from_files(local_df, openrouter_api_key, openrouter_model)
+            ss["file_topic_sig"] = _sig
+            ss["topic_profile"] = _prof
+            ss["file_topic_input"] = _prof["query"]
+        file_topic_query = st.sidebar.text_input(
+            "📌 从上传文件识别的检索主题（可修改）：",
+            key="file_topic_input",
+            help="系统根据上传文件内容自动识别。识别不准时请直接修改为英文关键词，检索将以这里为准。",
+        )
+        _zh = ss.get("topic_profile", {}).get("topic_zh")
+        if _zh and not custom_topic.strip():
+            st.sidebar.caption(f"识别到的文件主题：{_zh}")
+
     if custom_topic.strip():
         search_topic = custom_topic.strip()
-    elif not local_df.empty:
-        combined_content = " ".join(local_df["Abstract"].tolist() + local_df["Title"].tolist())
-        search_topic = clean_search_keyword(combined_content)
+    elif file_topic_query.strip():
+        search_topic = file_topic_query.strip()
+        active_profile = ss.get("topic_profile")
 else:
     selected_preset = st.sidebar.selectbox(
         "💡 从 33 项权威热点词库中选择：",
@@ -1480,9 +1632,11 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🔍 开始检索文献", type="primary", disabled=not search_topic):
     with st.spinner(f"正在全网（Tavily + PubMed）检索与【{search_topic}】相关的近 5 年文献..."):
         ss["web_df"], ss["search_msgs"] = fetch_web_and_pubmed_literature(
-            search_topic, tavily_api_key, max_doc_count
+            search_topic, tavily_api_key, max_doc_count,
+            synonyms=(active_profile or {}).get("synonyms"),
         )
         ss["searched_topic"] = search_topic
+        ss["searched_desc"] = (active_profile or {}).get("topic_zh", "")
 if not search_topic:
     st.sidebar.caption("👆 请先输入或选择一个主题（模式 1 也可直接上传文件）。")
 
@@ -1545,7 +1699,13 @@ with tab1:
             except Exception as e:
                 st.error(f"读取失败: {e}")
 
-    if st.button("🚀 撰写深度综述", type="primary"):
+    _stale = bool(ss["searched_topic"] and search_topic and ss["searched_topic"] != search_topic)
+    if _stale:
+        st.warning(
+            f"⚠️ 当前检索结果对应主题【{ss['searched_topic']}】，与侧边栏当前主题【{search_topic}】不一致。"
+            "请先点击“🔍 开始检索文献”刷新，否则综述会基于旧主题的文献。"
+        )
+    if st.button("🚀 撰写深度综述", type="primary", disabled=_stale):
         if not review_topic:
             st.error("请先在左侧边栏输入或选择一个具体的综述主题！")
         elif not openrouter_api_key:
@@ -1555,7 +1715,8 @@ with tab1:
         else:
             with st.spinner(f"AI 正在围绕【{review_topic}】撰写综述，可能需要 1-5 分钟（内容较长时会自动续写），请稍候..."):
                 display_text, raw_text, base_msgs = generate_5000_words_review(
-                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df, enable_glossary_checkbox
+                    openrouter_api_key, openrouter_model, review_topic, local_df, web_df, enable_glossary_checkbox,
+                    ss.get("searched_desc", "") if ss["searched_topic"] else (active_profile or {}).get("topic_zh", ""),
                 )
             if raw_text is None:
                 st.error(display_text)
