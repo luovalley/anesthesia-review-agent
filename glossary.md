@@ -164,6 +164,7 @@
 * Angiography — 血管造影术
 * Angioplasty — 血管成形术
 * Angiotensin — 血管紧张素
+* Angiotensin II — 血管紧张素II
 * Angiotensin-Converting Enzyme — 血管紧张素转换酶 (ACE)
 * Angiotensin-Converting Enzyme Inhibitor — 血管紧张素转换酶抑制剂 (ACEI)
 * Angiotensin Receptor Blocker — 血管紧张素受体拮抗剂 (ARB)
